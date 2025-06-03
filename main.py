@@ -14,6 +14,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUESS_CHANNEL_NAME = 'guess-my-rank'
 CHECK_CHANNEL_NAME = 'check-clips'
+CLIP_DATA_FILE = 'pending_clips.json'
 
 # Rank list with custom Discord emojis (replace with your actual emoji IDs)
 RANKS = [
@@ -136,7 +137,6 @@ class RankSelector(discord.ui.View):
                                 f"React with ✅ to approve or ❌ to reject this clip."
                 
                 moderation_message = await check_channel.send(message_content, file=file)
-                
                 # Add reactions for moderation
                 await moderation_message.add_reaction("✅")
                 await moderation_message.add_reaction("❌")
@@ -149,10 +149,22 @@ class RankSelector(discord.ui.View):
                     'user_mention': interaction.user.mention
                 }
                 
-                # Store in bot's memory (in production, you'd want to use a database)
+                # Load existing clip data (if any)
                 if not hasattr(bot, 'pending_clips'):
-                    bot.pending_clips = {}
+                    if os.path.exists(CLIP_DATA_FILE):
+                        with open(CLIP_DATA_FILE, 'r') as f:
+                            bot.pending_clips = json.load(f)
+                            # Convert keys back to int since JSON stores them as strings
+                            bot.pending_clips = {int(k): v for k, v in bot.pending_clips.items()}
+                    else:
+                        bot.pending_clips = {}
+
+                # Add the new clip data
                 bot.pending_clips[moderation_message.id] = clip_data
+
+                # Save to JSON file
+                with open(CLIP_DATA_FILE, 'w') as f:
+                    json.dump(bot.pending_clips, f, indent=2)
             
             # Confirm to user
             await interaction.followup.send(
@@ -294,9 +306,68 @@ async def on_ready():
     print(f'{bot.user} is connected and ready!')
     print(f'Servers: {len(bot.guilds)}')
     
-    # Initialize pending clips storage
+    # Load clip data if not already loaded
     if not hasattr(bot, 'pending_clips'):
-        bot.pending_clips = {}
+        if os.path.exists(CLIP_DATA_FILE):
+            with open(CLIP_DATA_FILE, 'r') as f:
+                bot.pending_clips = json.load(f)
+                bot.pending_clips = {int(k): v for k, v in bot.pending_clips.items()}
+        else:
+            bot.pending_clips = {}
+            
+@bot.event
+async def on_raw_reaction_add(payload):
+    if payload.user_id == bot.user.id:
+        return
+
+    message_id = payload.message_id
+
+    # Check if this is a pending clip
+    if message_id not in bot.pending_clips:
+        return
+
+    if str(payload.emoji) not in ["✅", "❌"]:
+        return
+
+    # Fetch necessary info
+    guild = bot.get_guild(payload.guild_id)
+    check_channel = guild.get_channel(payload.channel_id)
+    guess_channel = discord.utils.get(guild.text_channels, name="guess-my-rank")
+
+    if not check_channel or not guess_channel:
+        return
+
+    message = await check_channel.fetch_message(message_id)
+    clip_data = bot.pending_clips[message_id]
+
+    if str(payload.emoji) == "✅":
+        # Approve: forward the video and rank
+        if message.attachments:
+            video = message.attachments[0]
+            file = await video.to_file(filename=video.filename)
+            
+            await guess_channel.send(
+                f"🎮 **New Guess My Rank Clip!**\n\n"
+                f"Claimed rank: ||**{clip_data['rank']}**||",
+                file=file
+            )
+        
+        # Optionally: remove from pending and save
+        del bot.pending_clips[message_id]
+        with open(CLIP_DATA_FILE, 'w') as f:
+            json.dump(bot.pending_clips, f, indent=2)
+
+    elif str(payload.emoji) == "❌":
+        # Reject: optionally notify or log
+        await check_channel.send(
+            f"❌ Clip from {clip_data['user_mention']} rejected by moderator."
+        )
+        del bot.pending_clips[message_id]
+        with open(CLIP_DATA_FILE, 'w') as f:
+            json.dump(bot.pending_clips, f, indent=2)
+            
+            
+
 
 @bot.event
 async def on_reaction_add(reaction, user):
