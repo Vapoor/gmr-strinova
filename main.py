@@ -6,8 +6,9 @@ import asyncio
 import os
 import json
 import tempfile
-from typing import List, Optional
+from typing import List, Optional, Dict
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 # Configuration
 load_dotenv()
@@ -15,19 +16,21 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 GUESS_CHANNEL_NAME = 'guess-my-rank'
 CHECK_CHANNEL_NAME = 'check-clips'
 CLIP_DATA_FILE = 'pending_clips.json'
+RESULTS_DATA_FILE = 'clip_results.json'
 
 # Rank list with custom Discord emojis (replace with your actual emoji IDs)
 RANKS = [
-    {"name": "Substance", "emoji": "<:Substance:1379365131129192488>"},
-    {"name": "Molecule", "emoji": "<:Molecule:1379365125408034918>"},
-    {"name": "Atom", "emoji": "<:Atom:1379365121176109108>"},
-    {"name": "Proton", "emoji": "<:Proton:1379365128213893140>"},
-    {"name": "Neutron", "emoji": "<:Neutron:1379365126842351706>"},
-    {"name": "Electron", "emoji": "<:Electron:1379365122988048485>"},
-    {"name": "Quark", "emoji": "<:Masters:1379365124309254146>"},
+    {"name": "Singularity", "emoji": "<:Singularity:1379365129380036618>"},
     {"name": "Superstring", "emoji": "<:Superstring:1379365132592873482>"},
-    {"name": "Singularity", "emoji": "<:Singularity:1379365129380036618>"}
+    {"name": "Quark", "emoji": "<:Masters:1379365124309254146>"},
+    {"name": "Electron", "emoji": "<:Electron:1379365122988048485>"},
+    {"name": "Neutron", "emoji": "<:Neutron:1379365126842351706>"},
+    {"name": "Proton", "emoji": "<:Proton:1379365128213893140>"},
+    {"name": "Atom", "emoji": "<:Atom:1379365121176109108>"},
+    {"name": "Molecule", "emoji": "<:Molecule:1379365125408034918>"},
+    {"name": "Substance", "emoji": "<:Substance:1379365131129192488>"}
 ]
+
 # Bot configuration
 intents = discord.Intents.default()
 intents.message_content = True
@@ -142,7 +145,6 @@ class RankSelector(discord.ui.View):
                 await moderation_message.add_reaction("❌")
                 
                 # Store clip data in message for later use
-                # We'll use the message ID to track the data
                 clip_data = {
                     'rank': self.selected_rank,
                     'user_id': interaction.user.id,
@@ -194,15 +196,72 @@ class RankSelector(discord.ui.View):
             print(f"Processing Error : {e}")
             cleanup_files([self.video_path])
 
-async def blur_video(input_path: str, blur_width: int = 400, blur_height: int = 200, target_size_mb: int = 20) -> str:
-    """Always apply top-left blur and compress video using FFmpeg."""
+class GuessRankSelector(discord.ui.View):
+    def __init__(self, clip_id: str, correct_rank: str):
+        super().__init__(timeout=None)  # No timeout since we handle expiry manually
+        self.clip_id = clip_id
+        self.correct_rank = correct_rank
+        self.user_votes = {}  # Track user votes to prevent double voting
+        
+        # Create dropdown menu with all ranks and emojis
+        self.rank_select = discord.ui.Select(
+            placeholder="Guess the rank...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=rank["name"], 
+                    value=rank["name"], 
+                    emoji=rank["emoji"]
+                ) for rank in RANKS
+            ]
+        )
+        self.rank_select.callback = self.guess_callback
+        self.add_item(self.rank_select)
+    
+    async def guess_callback(self, interaction: discord.Interaction):
+        # Check if user already voted
+        if interaction.user.id in self.user_votes:
+            await interaction.response.send_message(
+                f"You already voted for **{self.user_votes[interaction.user.id]}**!", 
+                ephemeral=True
+            )
+            return
+        
+        # Check if voting period is still active
+        results_data = load_results_data()
+        clip_data = results_data.get(self.clip_id)
+        
+        if not clip_data:
+            await interaction.response.send_message("❌ Clip data not found!", ephemeral=True)
+            return
+        
+        # Check if voting has expired
+        end_time = datetime.fromisoformat(clip_data['end_time'])
+        if datetime.now() > end_time:
+            await interaction.response.send_message("⏰ Voting period has ended!", ephemeral=True)
+            return
+        
+        selected_rank = self.rank_select.values[0]
+        self.user_votes[interaction.user.id] = selected_rank
+        
+        # Save vote to results
+        save_vote(self.clip_id, selected_rank, interaction.user.id)
+        
+        await interaction.response.send_message(
+            f"✅ Your guess: **{selected_rank}** has been recorded!", 
+            ephemeral=True
+        )
 
+async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
+    """Apply adaptive blur and compress video using FFmpeg."""
+    
     # Create temporary output file
     output_fd, output_path = tempfile.mkstemp(suffix='.mp4')
     os.close(output_fd)
 
     try:
-        # Step 1: Get video duration
+        # Step 1: Get video information
         probe_cmd = [
             'ffprobe', '-v', 'quiet', '-print_format', 'json',
             '-show_format', '-show_streams', input_path
@@ -217,20 +276,64 @@ async def blur_video(input_path: str, blur_width: int = 400, blur_height: int = 
             raise Exception(f"FFprobe failed: {stderr.decode()}")
 
         probe_data = json.loads(stdout.decode())
+        
+        # Get video stream info
+        video_stream = None
+        for stream in probe_data['streams']:
+            if stream['codec_type'] == 'video':
+                video_stream = stream
+                break
+        
+        if not video_stream:
+            raise Exception("No video stream found")
+        
         duration = float(probe_data['format']['duration'])
+        width = int(video_stream['width'])
+        height = int(video_stream['height'])
+        
+        # Calculate adaptive blur regions
+        # Left region: full height, 30% of width
+        left_blur_x = 103
+        left_blur_y = 98
+        left_blur_width = 333
+        left_blur_height = 240
+        
+        # Bottom center region: 40% width, 25% height
+        bottom_blur_width = 293
+        bottom_blur_height = 28
+        bottom_blur_x = 764
+        bottom_blur_y = 1032
+
+        voice_chat_width = 229
+        voice_chat_height = 188
+        voice_chat_x = 1952
+        voice_chat_y = 417
+
+        text_chat_width = 425
+        text_chat_height = 168
+        text_chat_x = 25
+        text_chat_y = 695
 
         # Step 2: Compute bitrate to hit target size
-        # bitrate (kbps) = size_MB * 8192 / duration_sec
         target_bitrate_kbps = int((target_size_mb * 8192) / duration)
         target_bitrate_kbps = max(500, min(target_bitrate_kbps, 5000))  # Clamp to reasonable range
 
-        # Step 3: Build FFmpeg command
+        # Step 3: Build FFmpeg command with adaptive blur
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-i', input_path,
 
-            # Complex filter: blur top-left region
+            # Complex filter: blur left region and bottom center region
             '-filter_complex',
-            f"[0:v]crop={blur_width}:{blur_height}:0:0,boxblur=10:1[blur];[0:v][blur]overlay=0:0",
+            f"[0:v]split=5[main][left_crop][bottom_crop][voice_crop][text_crop];"
+            f"[left_crop]crop={left_blur_width}:{left_blur_height}:{left_blur_x}:{left_blur_y},boxblur=lr=14:cr=6[left_blur];"
+            f"[bottom_crop]crop={bottom_blur_width}:{bottom_blur_height}:{bottom_blur_x}:{bottom_blur_y},boxblur=lr=14:cr=6[bottom_blur];"
+            f"[voice_crop]crop={voice_chat_width}:{voice_chat_height}:{voice_chat_x}:{voice_chat_y},boxblur=lr=14:cr=6[voice_blur];"
+            f"[text_crop]crop={text_chat_width}:{text_chat_height}:{text_chat_x}:{text_chat_y},boxblur=lr=14:cr=6[text_blur];"
+            f"[main][left_blur]overlay={left_blur_x}:{left_blur_y}[tmp1];"
+            f"[tmp1][bottom_blur]overlay={bottom_blur_x}:{bottom_blur_y}[tmp2];"
+            f"[tmp2][voice_blur]overlay={voice_chat_x}:{voice_chat_y}[tmp3];"
+            f"[tmp3][text_blur]overlay={text_chat_x}:{text_chat_y}",
+
 
             # Video compression
             '-c:v', 'libx264',
@@ -263,12 +366,16 @@ async def blur_video(input_path: str, blur_width: int = 400, blur_height: int = 
         # Step 5: Report result
         final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
         print(f"Blurred and compressed: {input_path} -> {final_size_mb:.2f} MB at {target_bitrate_kbps} kbps")
+        print(f"Video dimensions: {width}x{height}")
+        print(f"Left blur region: {left_blur_width}x{left_blur_height}")
+        print(f"Bottom blur region: {bottom_blur_width}x{bottom_blur_height} at ({bottom_blur_x}, {bottom_blur_y})")
         return output_path
 
     except Exception as e:
         if os.path.exists(output_path):
             os.remove(output_path)
         raise e
+
 def cleanup_files(file_paths: List[str]):
     """Clean up temporary files"""
     for path in file_paths:
@@ -277,6 +384,120 @@ def cleanup_files(file_paths: List[str]):
                 os.remove(path)
         except Exception as e:
             print(f"Error cleaning up {path}: {e}")
+
+def load_results_data() -> Dict:
+    """Load results data from JSON file"""
+    if os.path.exists(RESULTS_DATA_FILE):
+        with open(RESULTS_DATA_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_results_data(data: Dict):
+    """Save results data to JSON file"""
+    with open(RESULTS_DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def create_clip_entry(correct_rank: str) -> str:
+    """Create a new clip entry in results data"""
+    results_data = load_results_data()
+    
+    # Generate unique clip ID
+    clip_id = f"clip_{len(results_data) + 1}_{int(datetime.now().timestamp())}"
+    
+    # Create entry
+    end_time = datetime.now() + timedelta(hours=24)
+    
+    clip_entry = {
+        'correct_rank': correct_rank,
+        'end_time': end_time.isoformat(),
+        'votes': {rank['name']: [] for rank in RANKS},  # Store user IDs who voted for each rank
+        'total_votes': 0,
+        'expired': False
+    }
+    
+    results_data[clip_id] = clip_entry
+    save_results_data(results_data)
+    
+    return clip_id
+
+def save_vote(clip_id: str, guessed_rank: str, user_id: int):
+    """Save a user's vote"""
+    results_data = load_results_data()
+    
+    if clip_id not in results_data:
+        return False
+    
+    # Check if user already voted
+    for rank_votes in results_data[clip_id]['votes'].values():
+        if user_id in rank_votes:
+            return False  # User already voted
+    
+    # Add vote
+    results_data[clip_id]['votes'][guessed_rank].append(user_id)
+    results_data[clip_id]['total_votes'] += 1
+    
+    save_results_data(results_data)
+    return True
+
+def get_results_embed(clip_id: str) -> discord.Embed:
+    """Generate results embed with percentages"""
+    results_data = load_results_data()
+    clip_data = results_data.get(clip_id)
+    
+    if not clip_data:
+        return None
+    
+    correct_rank = clip_data['correct_rank']
+    total_votes = clip_data['total_votes']
+    
+    embed = discord.Embed(
+        title="🎯 Results - Guess My Rank",
+        description=f"**Correct Rank:** {correct_rank}\n**Total Votes:** {total_votes}",
+        color=0x00ff00
+    )
+    
+    # Calculate percentages
+    results_text = ""
+    for rank in RANKS:
+        rank_name = rank['name']
+        votes_count = len(clip_data['votes'].get(rank_name, []))
+        percentage = (votes_count / total_votes * 100) if total_votes > 0 else 0
+        
+        emoji = rank['emoji']
+        if rank_name == correct_rank:
+            results_text += f"{emoji} **{rank_name}**: {votes_count} votes ({percentage:.1f}%) ✅\n"
+        else:
+            results_text += f"{emoji} {rank_name}: {votes_count} votes ({percentage:.1f}%)\n"
+    
+    embed.add_field(name="📊 Vote Distribution", value=results_text, inline=False)
+    
+    return embed
+
+async def check_expired_clips():
+    """Check for expired clips and post results"""
+    results_data = load_results_data()
+    current_time = datetime.now()
+    
+    for clip_id, clip_data in results_data.items():
+        if clip_data['expired']:
+            continue
+            
+        end_time = datetime.fromisoformat(clip_data['end_time'])
+        
+        if current_time > end_time:
+            # Mark as expired
+            clip_data['expired'] = True
+            
+            # Find the guess channel and post results
+            for guild in bot.guilds:
+                guess_channel = discord.utils.get(guild.channels, name=GUESS_CHANNEL_NAME)
+                if guess_channel:
+                    results_embed = get_results_embed(clip_id)
+                    if results_embed:
+                        await guess_channel.send(embed=results_embed)
+                    break
+    
+    save_results_data(results_data)
 
 async def save_video_from_attachment(attachment: discord.Attachment) -> Optional[str]:
     """Download and save video from Discord attachment"""
@@ -314,7 +535,19 @@ async def on_ready():
                 bot.pending_clips = {int(k): v for k, v in bot.pending_clips.items()}
         else:
             bot.pending_clips = {}
-            
+    
+    # Start background task to check expired clips
+    bot.loop.create_task(background_check_expired())
+
+async def background_check_expired():
+    """Background task to check for expired clips every minute"""
+    while True:
+        try:
+            await check_expired_clips()
+        except Exception as e:
+            print(f"Error checking expired clips: {e}")
+        await asyncio.sleep(60)  # Check every minute
+
 @bot.event
 async def on_raw_reaction_add(payload):
     if payload.user_id == bot.user.id:
@@ -341,117 +574,55 @@ async def on_raw_reaction_add(payload):
     clip_data = bot.pending_clips[message_id]
 
     if str(payload.emoji) == "✅":
-        # Approve: forward the video and rank
+        # Approve: forward the video with rank selector
         if message.attachments:
             video = message.attachments[0]
             file = await video.to_file(filename=video.filename)
             
+            # Create clip entry in results data
+            clip_id = create_clip_entry(clip_data['rank'])
+            
+            # Create view with rank selector
+            view = GuessRankSelector(clip_id, clip_data['rank'])
+            
             await guess_channel.send(
                 f"🎮 **New Guess My Rank Clip!**\n\n"
-                f"Claimed rank: ||**{clip_data['rank']}**||",
-                file=file
+                f"Watch this video and guess the player's rank!\n"
+                f"You have 24 hours to vote.",
+                file=file,
+                view=view
             )
         
-        # Optionally: remove from pending and save
+        # Delete the moderation message
+        try:
+            await message.delete()
+        except:
+            pass
+        
+        # Remove from pending clips
         del bot.pending_clips[message_id]
         with open(CLIP_DATA_FILE, 'w') as f:
             json.dump(bot.pending_clips, f, indent=2)
 
     elif str(payload.emoji) == "❌":
-        # Reject: optionally notify or log
-        await check_channel.send(
-            f"❌ Clip from {clip_data['user_mention']} rejected by moderator."
-        )
-        del bot.pending_clips[message_id]
-        with open(CLIP_DATA_FILE, 'w') as f:
-            json.dump(bot.pending_clips, f, indent=2)
-            
-            
-
-
-@bot.event
-async def on_reaction_add(reaction, user):
-    """Handle moderation reactions in check-clips channel"""
-    
-    # Ignore bot reactions
-    if user == bot.user:
-        return
-    
-    # Only handle reactions in check-clips channel
-    if reaction.message.channel.name != CHECK_CHANNEL_NAME:
-        return
-    
-    # Check if this message has pending clip data
-    if not hasattr(bot, 'pending_clips') or reaction.message.id not in bot.pending_clips:
-        return
-    
-    clip_data = bot.pending_clips[reaction.message.id]
-    
-    # Handle approval (✅)
-    if str(reaction.emoji) == "✅":
-        # Find guess-my-rank channel
-        guess_channel = None
-        for guild in bot.guilds:
-            found_channel = discord.utils.get(guild.channels, name=GUESS_CHANNEL_NAME)
-            if found_channel:
-                guess_channel = found_channel
-                break
-        
-        if guess_channel:
-            # Get the video attachment from the moderation message
-            video_attachment = None
-            for attachment in reaction.message.attachments:
-                if attachment.filename.endswith('.mp4'):
-                    video_attachment = attachment
-                    break
-            
-            if video_attachment:
-                # Download and re-upload to guess-my-rank channel
-                temp_path = await save_video_from_attachment(video_attachment)
-                if temp_path:
-                    try:
-                        with open(temp_path, 'rb') as f:
-                            file = discord.File(f, filename='guess_my_rank.mp4')
-                            message = f"🎮 **New Challenge - Guess My Rank!**\n\n" \
-                                     f"Watch this video and guess the player's rank!\n" \
-                                     f"Answer: ||{clip_data['rank']}||"
-                            
-                            await guess_channel.send(message, file=file)
-                        
-                        # Add success reaction to moderation message
-                        await reaction.message.add_reaction("🎉")
-                        
-                        # Notify submitter if possible
-                        try:
-                            submitter = bot.get_user(clip_data['user_id'])
-                            if submitter:
-                                await submitter.send(f"✅ Your clip has been approved and posted in {GUESS_CHANNEL_NAME}!")
-                        except:
-                            pass  # Ignore if can't send DM
-                            
-                    except Exception as e:
-                        print(f"Error posting approved clip: {e}")
-                    finally:
-                        cleanup_files([temp_path])
-        
-        # Remove from pending clips
-        del bot.pending_clips[reaction.message.id]
-    
-    # Handle rejection (❌)
-    elif str(reaction.emoji) == "❌":
-        # Add rejection reaction
-        await reaction.message.add_reaction("🗑️")
+        # Reject: delete the message and notify
+        try:
+            await message.delete()
+        except:
+            pass
         
         # Notify submitter if possible
         try:
             submitter = bot.get_user(clip_data['user_id'])
             if submitter:
-                await submitter.send(f"❌ Your clip has been rejected from the mods.")
+                await submitter.send(f"❌ Your clip has been rejected by the moderators.")
         except:
-            pass  # Ignore if can't send DM
+            pass
         
         # Remove from pending clips
-        del bot.pending_clips[reaction.message.id]
+        del bot.pending_clips[message_id]
+        with open(CLIP_DATA_FILE, 'w') as f:
+            json.dump(bot.pending_clips, f, indent=2)
 
 @bot.event
 async def on_message(message):
@@ -494,6 +665,9 @@ async def on_message(message):
         else:
             await message.reply("📹 Please send a video (.mp4, .avi, .mov, etc.) to use the bot!")
     
+    else:
+        if (message.content != "!help"):
+            await message.reply("Hi ! If you want Julian to treat your clip, just send a (.mp4, .avi etc..)")
     # Process other commands
     await bot.process_commands(message)
 
@@ -570,37 +744,130 @@ async def help_command(ctx):
         description="This bot allows you to create rank guessing challenges!",
         color=0x0099ff
     )
-    
     embed.add_field(
         name="📱 How to use:",
         value="1. Send me a video in private message\n"
               "2. Select your rank from the menu\n"
               "3. Your video will be submitted for moderation\n"
-              "4. Once approved, it will appear in #guess-my-rank",
+              "4. Once approved, it will appear in #guess-my-rank with a voting system\n"
+              "5. Results are shown after 24 hours",
         inline=False
     )
-    
     embed.add_field(
         name="🛠️ Commands:",
         value="`!setup` - Create required channels (Admin)\n"
-              "`!help_rank` - Show this help",
+              "`!help_rank` - Show this help\n"
+              "`!results [clip_id]` - Show results for a specific clip",
         inline=False
     )
-    
     embed.add_field(
         name="🎮 Supported formats:",
         value="MP4, AVI, MOV, MKV, WMV, FLV, WEBM",
         inline=False
     )
-    
     embed.add_field(
         name="🔍 Moderation:",
         value="All clips go through moderation in #check-clips\n"
-              "Moderators can approve (✅) or reject (❌) submissions",
+              "Moderators can approve (✅) or reject (❌) submissions\n"
+              "Approved clips get 24h voting period with automatic results",
         inline=False
     )
     
     await ctx.send(embed=embed)
+
+@bot.command(name='results')
+async def show_results(ctx, clip_id: str = None):
+    """Show results for a specific clip"""
+    if not clip_id:
+        await ctx.send("❌ Please provide a clip ID. Usage: `!results clip_123`")
+        return
+    
+    results_data = load_results_data()
+    if clip_id not in results_data:
+        await ctx.send(f"❌ Clip ID '{clip_id}' not found.")
+        return
+    
+    results_embed = get_results_embed(clip_id)
+    if results_embed:
+        await ctx.send(embed=results_embed)
+    else:
+        await ctx.send("❌ Error generating results.")
+
+@bot.command(name='stats')
+@commands.has_permissions(manage_messages=True)
+async def show_stats(ctx):
+    """Show overall statistics"""
+    results_data = load_results_data()
+    
+    if not results_data:
+        await ctx.send("📊 No clips data available yet.")
+        return
+    
+    total_clips = len(results_data)
+    total_votes = sum(clip['total_votes'] for clip in results_data.values())
+    active_clips = sum(1 for clip in results_data.values() if not clip['expired'])
+    
+    # Calculate rank accuracy
+    rank_accuracy = {}
+    for rank in RANKS:
+        rank_name = rank['name']
+        correct_guesses = 0
+        total_for_rank = 0
+        
+        for clip_data in results_data.values():
+            if clip_data['correct_rank'] == rank_name:
+                total_for_rank += 1
+                correct_votes = len(clip_data['votes'].get(rank_name, []))
+                if correct_votes > 0:
+                    correct_guesses += correct_votes
+        
+        if total_for_rank > 0:
+            accuracy = (correct_guesses / total_for_rank) if total_for_rank > 0 else 0
+            rank_accuracy[rank_name] = {
+                'accuracy': accuracy,
+                'clips': total_for_rank,
+                'emoji': rank['emoji']
+            }
+    
+    embed = discord.Embed(
+        title="📊 Guess My Rank Statistics",
+        color=0x0099ff
+    )
+    
+    embed.add_field(
+        name="📈 Overall Stats",
+        value=f"Total Clips: {total_clips}\n"
+              f"Total Votes: {total_votes}\n"
+              f"Active Clips: {active_clips}",
+        inline=False
+    )
+    
+    if rank_accuracy:
+        accuracy_text = ""
+        for rank_name, data in rank_accuracy.items():
+            accuracy_text += f"{data['emoji']} {rank_name}: {data['accuracy']:.1%} ({data['clips']} clips)\n"
+        
+        embed.add_field(
+            name="🎯 Rank Accuracy",
+            value=accuracy_text,
+            inline=False
+        )
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='cleanup')
+@commands.has_permissions(administrator=True)
+async def cleanup_expired(ctx):
+    """Clean up expired clips data (Admin only)"""
+    results_data = load_results_data()
+    
+    expired_count = 0
+    for clip_id in list(results_data.keys()):
+        if results_data[clip_id]['expired']:
+            # Keep data but could add archiving logic here
+            expired_count += 1
+    
+    await ctx.send(f"📋 Found {expired_count} expired clips in database.")
 
 # Error handling
 @bot.event
@@ -610,7 +877,13 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.CommandNotFound):
         pass  # Ignore unknown commands
     else:
-        await ctx.send(f"❌ An error occurred")
+        await ctx.send(f"❌ An error occurred: {str(error)}")
+        print(f"Command error: {error}")
+
+# Additional event handlers for better error handling
+@bot.event
+async def on_error(event, *args, **kwargs):
+    print(f"Bot error in {event}: {args}")
 
 if __name__ == "__main__":
     # Dependency checks
@@ -622,11 +895,25 @@ if __name__ == "__main__":
         print("Install it with: pip install opencv-python")
         exit(1)
     
-    print("🤖 Starting bot...")
-    print("📝 Don't forget to:")
-    print("   1. Replace TOKEN with your bot token")
-    print("   2. Install dependencies: pip install discord.py opencv-python")
-    print("   3. Give proper permissions to the bot on Discord")
-    print("   4. Create both #guess-my-rank and #check-clips channels")
+    # Check for FFmpeg
+    try:
+        import subprocess
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+        if result.returncode != 0:
+            print("❌ Error: FFmpeg is not installed or not in PATH.")
+            print("Please install FFmpeg: https://ffmpeg.org/download.html")
+            exit(1)
+    except FileNotFoundError:
+        print("❌ Error: FFmpeg is not installed or not in PATH.")
+        print("Please install FFmpeg: https://ffmpeg.org/download.html")
+        exit(1)
+    
+    print("🤖 Starting enhanced Guess My Rank bot...")
+    print("📋 Requirements:")
+    print("   1. Set DISCORD_TOKEN in .env file")
+    print("   2. Install dependencies: pip install discord.py opencv-python python-dotenv")
+    print("   3. Install FFmpeg and add to PATH")
+    print("   4. Bot needs proper Discord permissions")
+    print("   5. Use !setup command to create channels")
     
     bot.run(TOKEN)
