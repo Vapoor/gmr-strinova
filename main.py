@@ -899,12 +899,15 @@ async def on_message(message):
     await bot.process_commands(message)
 
 @tree.command(name="setup", description="Setup both channels use for the game")
-@commands.has_permissions(manage_channels=True)
-async def setup_channels(ctx):
+async def setup_channels(interaction : discord.Interaction):
     """Command to configure channel names and create channels if needed"""
     
-    # Vérifier la configuration actuelle
-    check_channel_name, guess_channel_name = get_channel_names(ctx.guild.id)
+    # Check if the user got perms to execute Setup
+    
+    if not interaction.user.guild_permissions.manage_channels:
+        await interaction.response.send_message("You don't have permission to setup the channels", ephemeral=True)
+        return
+    check_channel_name, guess_channel_name = get_channel_names(interaction.guild.id)
     
     embed = discord.Embed(
         title="🛠️ Channel Setup",
@@ -924,7 +927,7 @@ async def setup_channels(ctx):
             modal = ChannelSetupModal()
             await interaction.response.send_modal(modal)
     
-    await ctx.send(embed=embed, view=SetupView())
+    await interaction.response.send_message(embed=embed, view=SetupView(), ephemeral=True)
 
 @tree.command(name="help", description="Show help for Guess My Rank bot")
 async def help_slash_command(interaction: discord.Interaction):
@@ -964,7 +967,7 @@ async def help_slash_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="results", description="Display last days results")
-async def show_results(ctx):
+async def show_results(interaction : discord.Interaction):
     """Show results browser for finished clips"""
     
     results_data = load_results_data()
@@ -976,7 +979,7 @@ async def show_results(ctx):
             description="No finished clips found yet. Wait for some clips to complete their 24-hour voting period!",
             color=0xff9900
         )
-        await ctx.send(embed=embed)
+        await interaction.response.send_message(embed=embed)
         return
     
     embed = discord.Embed(
@@ -986,73 +989,13 @@ async def show_results(ctx):
     )
     
     view = ResultsSelector()
-    await ctx.send(embed=embed, view=view)
+    await interaction.response.send_message(embed=embed, view=view)
 
-@bot.command(name='stats')
-@commands.has_permissions(manage_messages=True)
-async def show_stats(ctx):
-    """Show overall statistics"""
-    results_data = load_results_data()
-    
-    if not results_data:
-        await ctx.send("📊 No clips data available yet.")
+@tree.command(name="cleanup", description="Cleanup last clips that are outdated")
+async def cleanup_expired(interaction : discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You don't have permission to cleanup", ephemeral=True)
         return
-    
-    total_clips = len(results_data)
-    total_votes = sum(clip['total_votes'] for clip in results_data.values())
-    active_clips = sum(1 for clip in results_data.values() if not clip['expired'])
-    
-    # Calculate rank accuracy
-    rank_accuracy = {}
-    for rank in RANKS:
-        rank_name = rank['name']
-        correct_guesses = 0
-        total_for_rank = 0
-        
-        for clip_data in results_data.values():
-            if clip_data['correct_rank'] == rank_name:
-                total_for_rank += 1
-                correct_votes = len(clip_data['votes'].get(rank_name, []))
-                if correct_votes > 0:
-                    correct_guesses += correct_votes
-        
-        if total_for_rank > 0:
-            accuracy = (correct_guesses / total_for_rank) if total_for_rank > 0 else 0
-            rank_accuracy[rank_name] = {
-                'accuracy': accuracy,
-                'clips': total_for_rank,
-                'emoji': rank['emoji']
-            }
-    
-    embed = discord.Embed(
-        title="📊 Guess My Rank Statistics",
-        color=0x0099ff
-    )
-    
-    embed.add_field(
-        name="📈 Overall Stats",
-        value=f"Total Clips: {total_clips}\n"
-              f"Total Votes: {total_votes}\n"
-              f"Active Clips: {active_clips}",
-        inline=False
-    )
-    
-    if rank_accuracy:
-        accuracy_text = ""
-        for rank_name, data in rank_accuracy.items():
-            accuracy_text += f"{data['emoji']} {rank_name}: {data['accuracy']:.1%} ({data['clips']} clips)\n"
-        
-        embed.add_field(
-            name="🎯 Rank Accuracy",
-            value=accuracy_text,
-            inline=False
-        )
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='cleanup')
-@commands.has_permissions(administrator=True)
-async def cleanup_expired(ctx):
     """Clean up expired clips data (Admin only)"""
     results_data = load_results_data()
     
@@ -1062,7 +1005,7 @@ async def cleanup_expired(ctx):
             # Keep data but could add archiving logic here
             expired_count += 1
     
-    await ctx.send(f"📋 Found {expired_count} expired clips in database.")
+    await interaction.response.send_message(f"📋 Found {expired_count} expired clips in database.")
 
 # Error handling
 @bot.event
