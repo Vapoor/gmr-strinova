@@ -18,7 +18,6 @@ CHECK_CHANNEL_NAME = 'check-clips'
 CLIP_DATA_FILE = 'pending_clips.json'
 RESULTS_DATA_FILE = 'clip_results.json'
 
-# Rank list with custom Discord emojis (replace with your actual emoji IDs)
 RANKS = [
     {"name": "Singularity", "emoji": "<:Singularity:1379365129380036618>"},
     {"name": "Superstring", "emoji": "<:Superstring:1379365132592873482>"},
@@ -35,7 +34,186 @@ RANKS = [
 intents = discord.Intents.default()
 intents.message_content = True
 intents.reactions = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+
+
+##################################
+###### SETUP CLASS ###############
+##################################
+
+class ChannelSetupModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Channel Setup Configuration")
+        # Mod channel
+        self.check_channel_input = discord.ui.TextInput(
+            label="Check Channel Name",
+            placeholder="Enter the name for the moderation channel (e.g., check-clips)",
+            default="check-clips",
+            max_length=100,
+            required=True
+        )
+        #Guess my rank channel
+        self.guess_channel_input = discord.ui.TextInput(
+            label="Guess Channel Name", 
+            placeholder="Enter the name for the guessing channel (e.g., guess-my-rank)",
+            default="guess-my-rank",
+            max_length=100,
+            required=True
+        )
+        
+        self.add_item(self.check_channel_input)
+        self.add_item(self.guess_channel_input)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        check_channel_name = self.check_channel_input.value.strip()
+        guess_channel_name = self.guess_channel_input.value.strip()
+        
+        # Save conf
+        save_channel_config(interaction.guild.id, check_channel_name, guess_channel_name)
+        
+        # Create channel
+        created_channels = []
+        
+        # Verify and create
+        guess_channel = discord.utils.get(interaction.guild.channels, name=guess_channel_name)
+        if not guess_channel:
+            try:
+                guess_channel = await interaction.guild.create_text_channel(
+                    guess_channel_name,
+                    topic="🎮 Guess the rank of players from their videos!"
+                )
+                
+                welcome_embed = discord.Embed(
+                    title="🎮 Welcome to Guess My Rank!",
+                    description="In this channel, you'll see gameplay videos with the player's rank hidden.\n"
+                               "Try to guess the rank before revealing the answer!",
+                    color=0x00ff00
+                )
+                
+                await guess_channel.send(embed=welcome_embed)
+                created_channels.append(guess_channel_name)
+                
+            except discord.Forbidden:
+                await interaction.response.send_message("❌ I don't have permissions to create channels.", ephemeral=True)
+                return
+            except Exception as e:
+                await interaction.response.send_message(f"❌ Error creating {guess_channel_name}: {str(e)}", ephemeral=True)
+                return
+        
+        # Vérifier/créer le channel de vérification
+        check_channel = discord.utils.get(interaction.guild.channels, name=check_channel_name)
+        if not check_channel:
+            try:
+                check_channel = await interaction.guild.create_text_channel(
+                    check_channel_name,
+                    topic="🔍 Moderation channel for clip submissions"
+                )
+                
+                instructions_embed = discord.Embed(
+                    title="🔍 Clip Moderation",
+                    description="This channel is for moderating clip submissions.\n"
+                               "React with ✅ to approve clips or ❌ to reject them.\n"
+                               "Approved clips will be automatically posted to guess-my-rank.",
+                    color=0xff9900
+                )
+                
+                await check_channel.send(embed=instructions_embed)
+                created_channels.append(check_channel_name)
+                
+            except Exception as e:
+                await interaction.response.send_message(f"❌ Error creating {check_channel_name}: {str(e)}", ephemeral=True)
+                return
+        
+        if created_channels:
+            channels_list = ", ".join([f"#{name}" for name in created_channels])
+            await interaction.response.send_message(f"✅ Channels configured and created: {channels_list}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"✅ Channels configured: #{check_channel_name}, #{guess_channel_name}\n(Both channels already existed)", ephemeral=True)
+
+#####################################
+####### RESULT SELECTOR #############
+#####################################
+
+class ResultsSelector(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        
+        # Récupérer les clips terminés
+        results_data = load_results_data()
+        finished_clips = []
+        
+        for clip_id, clip_data in results_data.items():
+            if clip_data['expired']:
+                end_time = datetime.fromisoformat(clip_data['end_time'])
+                date_str = end_time.strftime("%Y-%m-%d %H:%M")
+                rank_emoji = next((rank['emoji'] for rank in RANKS if rank['name'] == clip_data['correct_rank']), '🎮')
+                
+                finished_clips.append({
+                    'clip_id': clip_id,
+                    'date': date_str,
+                    'rank': clip_data['correct_rank'],
+                    'emoji': rank_emoji,
+                    'votes': clip_data['total_votes']
+                })
+        
+        # Trier par date (plus récent d'abord)
+        finished_clips.sort(key=lambda x: x['date'], reverse=True)
+        
+        if not finished_clips:
+            # Pas de clips terminés
+            self.clip_select = discord.ui.Select(
+                placeholder="No finished clips available",
+                min_values=1,
+                max_values=1,
+                options=[discord.SelectOption(label="No clips", value="none", description="No finished clips found")]
+            )
+            self.clip_select.disabled = True
+        else:
+            # Limiter à 25 options (limite Discord)
+            finished_clips = finished_clips[:25]
+            
+            self.clip_select = discord.ui.Select(
+                placeholder="Select a clip to view results...",
+                min_values=1,
+                max_values=1,
+                options=[
+                    discord.SelectOption(
+                        label=f"{clip['date']} - {clip['rank']}",
+                        value=clip['clip_id'],
+                        description=f"{clip['votes']} votes • {clip['rank']} rank",
+                        emoji=clip['emoji']
+                    ) for clip in finished_clips
+                ]
+            )
+        
+        self.clip_select.callback = self.select_callback
+        self.add_item(self.clip_select)
+    
+    async def select_callback(self, interaction: discord.Interaction):
+        if self.clip_select.values[0] == "none":
+            await interaction.response.send_message("❌ No clips available.", ephemeral=True)
+            return
+        
+        clip_id = self.clip_select.values[0]
+        results_embed = get_results_embed(clip_id)
+        
+        if results_embed:
+            results_embed.set_footer(text=f"Clip ID: {clip_id}")
+            await interaction.response.send_message(embed=results_embed, ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Error loading results for this clip.", ephemeral=True)
+
+
+
+
+
+
+
+
+######################################
+###### DMS SELECTOR ##################
+######################################
+
 
 class RankSelector(discord.ui.View):
     def __init__(self, user_id: int, video_path: str):
@@ -44,7 +222,7 @@ class RankSelector(discord.ui.View):
         self.video_path = video_path
         self.selected_rank = None
         
-        # Create dropdown menu with all ranks and emojis
+        # Dropdown DMS
         self.rank_select = discord.ui.Select(
             placeholder="Choose your rank...",
             min_values=1,
@@ -69,15 +247,15 @@ class RankSelector(discord.ui.View):
         self.selected_rank = self.rank_select.values[0]
         await interaction.response.send_message(f"Selected rank: **{self.selected_rank}**\nProcessing video...", ephemeral=True)
         
-        # Process and send video
+        
         await self.process_and_send_video(interaction)
     
     async def process_and_send_video(self, interaction: discord.Interaction):
         try:
-            # Check original file size
+            #Check size
             original_size_mb = os.path.getsize(self.video_path) / (1024 * 1024)
             
-            if original_size_mb > 100:  # Reasonable limit to avoid very large files
+            if original_size_mb > 100:  # check is > 100MB
                 await interaction.followup.send(
                     f"❌ Video too large ({original_size_mb:.1f}MB)!\n"
                     f"Please use a video smaller than 100MB.", 
@@ -86,7 +264,7 @@ class RankSelector(discord.ui.View):
                 cleanup_files([self.video_path])
                 return
             
-            # Create blurred video with automatic compression
+            
             await interaction.followup.send(
                 f"🔄 Processing... (Video: {original_size_mb:.1f}MB)\n"
                 f"This may take a few minutes depending on size.",
@@ -94,6 +272,7 @@ class RankSelector(discord.ui.View):
             )
             
             try:
+                #Blur video asynchrone
                 blurred_video_path = await asyncio.wait_for(
                     blur_video(self.video_path),
                     timeout=300  # 5 minutes
@@ -114,10 +293,10 @@ class RankSelector(discord.ui.View):
                 cleanup_files([self.video_path, blurred_video_path])
                 return
             
-            # Find the check-clips channel in all servers where the bot is present
+           
             check_channel = None
             for guild in bot.guilds:
-                found_channel = discord.utils.get(guild.channels, name=CHECK_CHANNEL_NAME)
+                found_channel = discord.utils.get(guild.channels, name=CHECK_CHANNEL_NAME) #check if check-clips exist
                 if found_channel:
                     check_channel = found_channel
                     break
@@ -131,7 +310,7 @@ class RankSelector(discord.ui.View):
                 cleanup_files([self.video_path, blurred_video_path])
                 return
             
-            # Send video to check-clips channel for moderation
+            # Send the video in the channel
             with open(blurred_video_path, 'rb') as f:
                 file = discord.File(f, filename='guess_my_rank.mp4')
                 message_content = f"🎮 **Clip Submission for Review**\n\n" \
@@ -208,6 +387,7 @@ class GuessRankSelector(discord.ui.View):
             placeholder="Guess the rank...",
             min_values=1,
             max_values=1,
+            custom_id=f"guess_rank_select_{clip_id}",
             options=[
                 discord.SelectOption(
                     label=rank["name"], 
@@ -249,7 +429,8 @@ class GuessRankSelector(discord.ui.View):
         save_vote(self.clip_id, selected_rank, interaction.user.id)
         
         await interaction.response.send_message(
-            f"✅ Your guess: **{selected_rank}** has been recorded!", 
+            f"✅ Your guess: **{selected_rank}** has been recorded!\n"
+            f"The rank in the clip was **{self.correct_rank}**", 
             ephemeral=True
         )
 
@@ -306,7 +487,7 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
 
         voice_chat_width = 229
         voice_chat_height = 188
-        voice_chat_x = 1952
+        voice_chat_x = 38
         voice_chat_y = 417
 
         text_chat_width = 425
@@ -375,6 +556,40 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
         if os.path.exists(output_path):
             os.remove(output_path)
         raise e
+    
+    
+#################
+### UTILS #######
+#################
+
+CHANNEL_CONFIG_FILE = 'channel_config.json'
+
+def load_channel_config() -> Dict:
+    """Load channel configuration from JSON file"""
+    if os.path.exists(CHANNEL_CONFIG_FILE):
+        with open(CHANNEL_CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_channel_config(guild_id: int, check_channel: str, guess_channel: str):
+    """Save channel configuration to JSON file"""
+    config = load_channel_config()
+    config[str(guild_id)] = {
+        'check_channel': check_channel,
+        'guess_channel': guess_channel
+    }
+    with open(CHANNEL_CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+
+def get_channel_names(guild_id: int) -> tuple:
+    """Get configured channel names for a guild"""
+    config = load_channel_config()
+    guild_config = config.get(str(guild_id), {})
+    
+    check_channel = guild_config.get('check_channel', CHECK_CHANNEL_NAME)
+    guess_channel = guild_config.get('guess_channel', GUESS_CHANNEL_NAME) 
+    
+    return check_channel, guess_channel    
 
 def cleanup_files(file_paths: List[str]):
     """Clean up temporary files"""
@@ -473,6 +688,12 @@ def get_results_embed(clip_id: str) -> discord.Embed:
     
     return embed
 
+async def register_persistent_views():
+    results_data = load_results_data()
+    for clip_id, clip in results_data.items():
+        if not clip['expired']:
+            bot.add_view(GuessRankSelector(clip_id, clip['correct_rank']))
+
 async def check_expired_clips():
     """Check for expired clips and post results"""
     results_data = load_results_data()
@@ -538,6 +759,9 @@ async def on_ready():
     
     # Start background task to check expired clips
     bot.loop.create_task(background_check_expired())
+    bot.loop.create_task(register_persistent_views())
+    # Reattach persistent views
+
 
 async def background_check_expired():
     """Background task to check for expired clips every minute"""
@@ -666,7 +890,7 @@ async def on_message(message):
             await message.reply("📹 Please send a video (.mp4, .avi, .mov, etc.) to use the bot!")
     
     else:
-        if (message.content != "!help"):
+        if isinstance(message.channel, discord.DMChannel) and message.content != "!help":
             await message.reply("Hi ! If you want Julian to treat your clip, just send a (.mp4, .avi etc..)")
     # Process other commands
     await bot.process_commands(message)
@@ -674,69 +898,32 @@ async def on_message(message):
 @bot.command(name='setup')
 @commands.has_permissions(manage_channels=True)
 async def setup_channels(ctx):
-    """Command to create both guess-my-rank and check-clips channels"""
+    """Command to configure channel names and create channels if needed"""
     
-    created_channels = []
+    # Vérifier la configuration actuelle
+    check_channel_name, guess_channel_name = get_channel_names(ctx.guild.id)
     
-    # Check and create guess-my-rank channel
-    guess_channel = discord.utils.get(ctx.guild.channels, name=GUESS_CHANNEL_NAME)
-    if not guess_channel:
-        try:
-            guess_channel = await ctx.guild.create_text_channel(
-                GUESS_CHANNEL_NAME,
-                topic="🎮 Guess the rank of players from their videos!"
-            )
-            
-            # Welcome message
-            welcome_embed = discord.Embed(
-                title="🎮 Welcome to Guess My Rank!",
-                description="In this channel, you'll see gameplay videos with the player's rank hidden.\n"
-                           "Try to guess the rank before revealing the answer!",
-                color=0x00ff00
-            )
-            
-            await guess_channel.send(embed=welcome_embed)
-            created_channels.append(GUESS_CHANNEL_NAME)
-            
-        except discord.Forbidden:
-            await ctx.send("❌ I don't have permissions to create channels.")
-            return
-        except Exception as e:
-            await ctx.send(f"❌ Error creating {GUESS_CHANNEL_NAME}")
-            return
+    embed = discord.Embed(
+        title="🛠️ Channel Setup",
+        description=f"Current configuration:\n"
+                   f"• Check channel: `{check_channel_name}`\n"
+                   f"• Guess channel: `{guess_channel_name}`\n\n"
+                   f"Click the button below to modify the configuration.",
+        color=0x0099ff
+    )
     
-    # Check and create check-clips channel
-    check_channel = discord.utils.get(ctx.guild.channels, name=CHECK_CHANNEL_NAME)
-    if not check_channel:
-        try:
-            check_channel = await ctx.guild.create_text_channel(
-                CHECK_CHANNEL_NAME,
-                topic="🔍 Moderation channel for clip submissions"
-            )
-            
-            # Instructions message
-            instructions_embed = discord.Embed(
-                title="🔍 Clip Moderation",
-                description="This channel is for moderating clip submissions.\n"
-                           "React with ✅ to approve clips or ❌ to reject them.\n"
-                           "Approved clips will be automatically posted to guess-my-rank.",
-                color=0xff9900
-            )
-            
-            await check_channel.send(embed=instructions_embed)
-            created_channels.append(CHECK_CHANNEL_NAME)
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error creating {CHECK_CHANNEL_NAME}")
-            return
+    class SetupView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+        
+        @discord.ui.button(label="Configure Channels", style=discord.ButtonStyle.primary, emoji="⚙️")
+        async def configure_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+            modal = ChannelSetupModal()
+            await interaction.response.send_modal(modal)
     
-    if created_channels:
-        channels_list = ", ".join([f"#{name}" for name in created_channels])
-        await ctx.send(f"✅ Created channels: {channels_list}")
-    else:
-        await ctx.send("ℹ️ All required channels already exist!")
+    await ctx.send(embed=embed, view=SetupView())
 
-@bot.command(name='help_rank')
+@bot.command(name='help')
 async def help_command(ctx):
     """Help command"""
     embed = discord.Embed(
@@ -756,7 +943,7 @@ async def help_command(ctx):
     embed.add_field(
         name="🛠️ Commands:",
         value="`!setup` - Create required channels (Admin)\n"
-              "`!help_rank` - Show this help\n"
+              "`!help` - Show this help\n"
               "`!results [clip_id]` - Show results for a specific clip",
         inline=False
     )
@@ -776,22 +963,29 @@ async def help_command(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name='results')
-async def show_results(ctx, clip_id: str = None):
-    """Show results for a specific clip"""
-    if not clip_id:
-        await ctx.send("❌ Please provide a clip ID. Usage: `!results clip_123`")
-        return
+async def show_results(ctx):
+    """Show results browser for finished clips"""
     
     results_data = load_results_data()
-    if clip_id not in results_data:
-        await ctx.send(f"❌ Clip ID '{clip_id}' not found.")
+    finished_clips = [clip_id for clip_id, clip_data in results_data.items() if clip_data['expired']]
+    
+    if not finished_clips:
+        embed = discord.Embed(
+            title="📊 No Results Available",
+            description="No finished clips found yet. Wait for some clips to complete their 24-hour voting period!",
+            color=0xff9900
+        )
+        await ctx.send(embed=embed)
         return
     
-    results_embed = get_results_embed(clip_id)
-    if results_embed:
-        await ctx.send(embed=results_embed)
-    else:
-        await ctx.send("❌ Error generating results.")
+    embed = discord.Embed(
+        title="📊 Browse Clip Results",
+        description="Select a clip from the dropdown menu below to view its results.",
+        color=0x0099ff
+    )
+    
+    view = ResultsSelector()
+    await ctx.send(embed=embed, view=view)
 
 @bot.command(name='stats')
 @commands.has_permissions(manage_messages=True)
@@ -884,6 +1078,7 @@ async def on_command_error(ctx, error):
 @bot.event
 async def on_error(event, *args, **kwargs):
     print(f"Bot error in {event}: {args}")
+    
 
 if __name__ == "__main__":
     # Dependency checks
