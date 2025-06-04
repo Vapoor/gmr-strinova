@@ -35,6 +35,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.reactions = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+tree = bot.tree
 
 
 ##################################
@@ -100,7 +101,6 @@ class ChannelSetupModal(discord.ui.Modal):
                 await interaction.response.send_message(f"❌ Error creating {guess_channel_name}: {str(e)}", ephemeral=True)
                 return
         
-        # Vérifier/créer le channel de vérification
         check_channel = discord.utils.get(interaction.guild.channels, name=check_channel_name)
         if not check_channel:
             try:
@@ -138,7 +138,7 @@ class ResultsSelector(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
         
-        # Récupérer les clips terminés
+        # Take all the clips that are dones
         results_data = load_results_data()
         finished_clips = []
         
@@ -156,11 +156,11 @@ class ResultsSelector(discord.ui.View):
                     'votes': clip_data['total_votes']
                 })
         
-        # Trier par date (plus récent d'abord)
+        # SortByDate
         finished_clips.sort(key=lambda x: x['date'], reverse=True)
         
         if not finished_clips:
-            # Pas de clips terminés
+            # No clip ended
             self.clip_select = discord.ui.Select(
                 placeholder="No finished clips available",
                 min_values=1,
@@ -169,7 +169,7 @@ class ResultsSelector(discord.ui.View):
             )
             self.clip_select.disabled = True
         else:
-            # Limiter à 25 options (limite Discord)
+            # Limit is 25 (discord)
             finished_clips = finished_clips[:25]
             
             self.clip_select = discord.ui.Select(
@@ -355,7 +355,7 @@ class RankSelector(discord.ui.View):
                 ephemeral=True
             )
             
-            # Clean up temporary files
+            # Clean up temp (to avoid losing 40GB of video lol)
             cleanup_files([self.video_path, blurred_video_path])
             
         except discord.HTTPException as e:
@@ -382,7 +382,7 @@ class GuessRankSelector(discord.ui.View):
         self.correct_rank = correct_rank
         self.user_votes = {}  # Track user votes to prevent double voting
         
-        # Create dropdown menu with all ranks and emojis
+        # Dropdown with emojis
         self.rank_select = discord.ui.Select(
             placeholder="Guess the rank...",
             min_values=1,
@@ -400,7 +400,7 @@ class GuessRankSelector(discord.ui.View):
         self.add_item(self.rank_select)
     
     async def guess_callback(self, interaction: discord.Interaction):
-        # Check if user already voted
+        # Already voted ?
         if interaction.user.id in self.user_votes:
             await interaction.response.send_message(
                 f"You already voted for **{self.user_votes[interaction.user.id]}**!", 
@@ -442,7 +442,6 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
     os.close(output_fd)
 
     try:
-        # Step 1: Get video information
         probe_cmd = [
             'ffprobe', '-v', 'quiet', '-print_format', 'json',
             '-show_format', '-show_streams', input_path
@@ -472,14 +471,16 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
         width = int(video_stream['width'])
         height = int(video_stream['height'])
         
-        # Calculate adaptive blur regions
-        # Left region: full height, 30% of width
+        # Here we got all the blur regions
+        # left_blur -> kill feed
+        # bottom blur -> replay nickname
+        # voice chat -> self-explanatory
+        # text_chat -> self-explanatory
         left_blur_x = 103
         left_blur_y = 98
         left_blur_width = 333
         left_blur_height = 240
         
-        # Bottom center region: 40% width, 25% height
         bottom_blur_width = 293
         bottom_blur_height = 28
         bottom_blur_x = 764
@@ -520,8 +521,8 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
             '-c:v', 'libx264',
             '-preset', 'medium',
             '-crf', '22',
-            '-maxrate', '2500k',
-            '-bufsize', '5000k',
+            '-maxrate', '2500k', # the higher is it, the better the quality
+            '-bufsize', '5000k', # bufsize ALWAYS x2 the maxrate
 
             # Audio
             '-c:a', 'aac',
@@ -615,21 +616,18 @@ def save_results_data(data: Dict):
 def create_clip_entry(correct_rank: str) -> str:
     """Create a new clip entry in results data"""
     results_data = load_results_data()
-    
     # Generate unique clip ID
     clip_id = f"clip_{len(results_data) + 1}_{int(datetime.now().timestamp())}"
-    
     # Create entry
     end_time = datetime.now() + timedelta(hours=24)
     
     clip_entry = {
         'correct_rank': correct_rank,
         'end_time': end_time.isoformat(),
-        'votes': {rank['name']: [] for rank in RANKS},  # Store user IDs who voted for each rank
+        'votes': {rank['name']: [] for rank in RANKS},  # Store user IDs
         'total_votes': 0,
         'expired': False
-    }
-    
+    }  
     results_data[clip_id] = clip_entry
     save_results_data(results_data)
     
@@ -735,7 +733,7 @@ async def save_video_from_attachment(attachment: discord.Attachment) -> Optional
     os.close(fd)
     
     try:
-        # Download file
+        # DL File
         await attachment.save(temp_path)
         return temp_path
     except Exception as e:
@@ -746,6 +744,7 @@ async def save_video_from_attachment(attachment: discord.Attachment) -> Optional
 @bot.event
 async def on_ready():
     print(f'{bot.user} is connected and ready!')
+    await tree.sync()
     print(f'Servers: {len(bot.guilds)}')
     
     # Load clip data if not already loaded
@@ -759,8 +758,9 @@ async def on_ready():
     
     # Start background task to check expired clips
     bot.loop.create_task(background_check_expired())
+    # Put back the views so we can votes even if the bot dc for a seconds, we didn't lose states
     bot.loop.create_task(register_persistent_views())
-    # Reattach persistent views
+    
 
 
 async def background_check_expired():
@@ -890,12 +890,15 @@ async def on_message(message):
             await message.reply("📹 Please send a video (.mp4, .avi, .mov, etc.) to use the bot!")
     
     else:
+        # I know its not beautiful to watch
         if isinstance(message.channel, discord.DMChannel) and message.content != "!help":
-            await message.reply("Hi ! If you want Julian to treat your clip, just send a (.mp4, .avi etc..)")
+            await message.reply("Hi ! If you want Julian to treat your clip, just send a video(.mp4, .avi etc..)")
+        if isinstance(message.channel, discord.DMChannel) and message.content != "!results":
+            await message.reply("Hi ! If you want Julian to treat your clip, just send a video(.mp4, .avi etc..)")
     # Process other commands
     await bot.process_commands(message)
 
-@bot.command(name='setup')
+@tree.command(name="setup", description="Setup both channels use for the game")
 @commands.has_permissions(manage_channels=True)
 async def setup_channels(ctx):
     """Command to configure channel names and create channels if needed"""
@@ -923,9 +926,8 @@ async def setup_channels(ctx):
     
     await ctx.send(embed=embed, view=SetupView())
 
-@bot.command(name='help')
-async def help_command(ctx):
-    """Help command"""
+@tree.command(name="help", description="Show help for Guess My Rank bot")
+async def help_slash_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🤖 Guess My Rank Bot - Help",
         description="This bot allows you to create rank guessing challenges!",
@@ -942,9 +944,9 @@ async def help_command(ctx):
     )
     embed.add_field(
         name="🛠️ Commands:",
-        value="`!setup` - Create required channels (Admin)\n"
-              "`!help` - Show this help\n"
-              "`!results [clip_id]` - Show results for a specific clip",
+        value="`/setup` - Create required channels (Admin)\n"
+              "`/help` - Show this help\n"
+              "`/results [clip_id]` - Show results for a specific clip",
         inline=False
     )
     embed.add_field(
@@ -959,10 +961,9 @@ async def help_command(ctx):
               "Approved clips get 24h voting period with automatic results",
         inline=False
     )
-    
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.command(name='results')
+@tree.command(name="results", description="Display last days results")
 async def show_results(ctx):
     """Show results browser for finished clips"""
     
