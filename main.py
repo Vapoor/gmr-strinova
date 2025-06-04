@@ -1,4 +1,7 @@
 import discord
+import aiohttp
+import validators
+import traceback
 from discord.ext import commands
 import cv2
 import numpy as np
@@ -17,6 +20,7 @@ GUESS_CHANNEL_NAME = 'guess-my-rank'
 CHECK_CHANNEL_NAME = 'check-clips'
 CLIP_DATA_FILE = 'pending_clips.json'
 RESULTS_DATA_FILE = 'clip_results.json'
+video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
 
 RANKS = [
     {"name": "Singularity", "emoji": "<:Singularity:1379365129380036618>"},
@@ -87,7 +91,7 @@ class ChannelSetupModal(discord.ui.Modal):
                 welcome_embed = discord.Embed(
                     title="🎮 Welcome to Guess My Rank!",
                     description="In this channel, you'll see gameplay videos with the player's rank hidden.\n"
-                               "Try to guess the rank before revealing the answer!",
+                               "Try to guess their ranks, a reveal will appear 24h later.",
                     color=0x00ff00
                 )
                 
@@ -111,10 +115,9 @@ class ChannelSetupModal(discord.ui.Modal):
                 
                 instructions_embed = discord.Embed(
                     title="🔍 Clip Moderation",
-                    description="This channel is for moderating clip submissions.\n"
+                    description=("This channel is for moderating clip submissions.\n"
                                "React with ✅ to approve clips or ❌ to reject them.\n"
-                               "Approved clips will be automatically posted to guess-my-rank.",
-                    color=0xff9900
+                               f"Approved clips will be automatically posted to **{GUESS_CHANNEL_NAME}**")
                 )
                 
                 await check_channel.send(embed=instructions_embed)
@@ -245,7 +248,7 @@ class RankSelector(discord.ui.View):
             return
         
         self.selected_rank = self.rank_select.values[0]
-        await interaction.response.send_message(f"Selected rank: **{self.selected_rank}**\nProcessing video...", ephemeral=True)
+        await interaction.response.send_message(f"Selected rank: **{self.selected_rank}**",ephemeral=True)
         
         
         await self.process_and_send_video(interaction)
@@ -255,10 +258,10 @@ class RankSelector(discord.ui.View):
             #Check size
             original_size_mb = os.path.getsize(self.video_path) / (1024 * 1024)
             
-            if original_size_mb > 100:  # check is > 100MB
+            if original_size_mb > 200:  # check is > 200MB
                 await interaction.followup.send(
-                    f"❌ Video too large ({original_size_mb:.1f}MB)!\n"
-                    f"Please use a video smaller than 100MB.", 
+                    f"❌ Video too large ({original_size_mb:.1f}MB)!\n",
+                    f"Please use a video smaller than 200MB.", 
                     ephemeral=True
                 )
                 cleanup_files([self.video_path])
@@ -266,8 +269,9 @@ class RankSelector(discord.ui.View):
             
             
             await interaction.followup.send(
-                f"🔄 Processing... (Video: {original_size_mb:.1f}MB)\n"
-                f"This may take a few minutes depending on size.",
+                f"🔄 Processing... (Video: {original_size_mb:.1f}MB)\n",
+                f"This may take a few minutes depending on size.\n",
+                f"If you using CatBox, please expect longer upload times (Maximum 15min before timeout)\n",
                 ephemeral=True
             )
             
@@ -362,8 +366,8 @@ class RankSelector(discord.ui.View):
             if e.code == 40005:  # Payload too large
                 await interaction.followup.send(
                     "❌ Video still too large after compression!\n"
-                    "Try with a shorter video (less than 30 seconds) or lower resolution.\n"
-                    "If the bot is answering a size under 25MB, contact vaporr on discord (I love Discord payload)",
+                    "Thats means that even after compression, you are still above 25MB.\n"
+                    "You can try to compress it yourself, or send a clip with lower resolution or shorter",
                     ephemeral=True
                 )
             else:
@@ -564,6 +568,45 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
 #################
 
 CHANNEL_CONFIG_FILE = 'channel_config.json'
+
+
+async def download_video_from_url(url: str, max_size_mb: int = 100) -> str | None:
+    try:
+        timeout = aiohttp.ClientTimeout(total=600) #10min timeout
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    print(f"HTTP error: {response.status}")
+                    return None
+
+                content_type = response.headers.get("Content-Type", "")
+                if "video" not in content_type and not url.lower().endswith(tuple(video_extensions)):
+                    print(f"Invalid content-type: {content_type}")
+                    return None
+
+                suffix = os.path.splitext(url.split("?")[0])[1]
+                fd, temp_path = tempfile.mkstemp(suffix=suffix)
+                os.close(fd)
+
+                max_bytes = max_size_mb * 1024 * 1024
+                total_downloaded = 0
+
+                with open(temp_path, "wb") as f:
+                    async for chunk in response.content.iter_chunked(64 * 1024):  # 64KB chunks
+                        total_downloaded += len(chunk)
+                        if total_downloaded > max_bytes:
+                            print("File too large, aborting")
+                            os.remove(temp_path)
+                            return None
+                        f.write(chunk)
+
+                return temp_path
+    except Exception as e:
+        print(f"Download error: {e}")
+        traceback.print_exc()
+        return None
 
 def load_channel_config() -> Dict:
     """Load channel configuration from JSON file"""
@@ -854,47 +897,52 @@ async def on_message(message):
     if message.author == bot.user:
         return
     
+    
+    video_path = None
+    
     # Process only private messages with attachments
-    if isinstance(message.channel, discord.DMChannel) and message.attachments:
+    if isinstance(message.channel, discord.DMChannel):
+        #Look if its a link
+        url = message.content.strip()
+        if url.startswith("https://files.catbox.moe/") and any(url.lower().endswith(ext) for ext in video_extensions):
+            if not validators.url(url):
+                await message.reply("That doesnt look like a valid link")
+                return
+            await message.add_reaction('⏳')
+            video_path = await download_video_from_url(url)
+
         
         # Look for video in attachments
-        video_attachment = None
-        for attachment in message.attachments:
-            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
-            if any(attachment.filename.lower().endswith(ext) for ext in video_extensions):
-                video_attachment = attachment
-                break
+        if not video_path:
+            for attachment in message.attachments:
+                if any(attachment.filename.lower().endswith(ext) for ext in video_extensions):
+                    await message.add_reaction('⏳')
+                    video_path = await save_video_from_attachment(attachment)
+                    break
         
-        if video_attachment:
-            # Download video
-            await message.add_reaction('⏳')  # Processing reaction
+        if video_path:
+            # Create rank selection view
+            view = RankSelector(message.author.id, video_path)
             
-            video_path = await save_video_from_attachment(video_attachment)
-            if video_path:
-                # Create rank selection view
-                view = RankSelector(message.author.id, video_path)
-                
-                embed = discord.Embed(
-                    title="🎮 Rank Selection",
-                    description="Choose your rank from the dropdown menu below.\n"
-                               "Your video will be submitted for moderation before appearing in guess-my-rank.",
-                    color=0x00ff00
-                )
-                
-                await message.reply(embed=embed, view=view)
-                await message.remove_reaction('⏳', bot.user)
-                await message.add_reaction('✅')
-            else:
-                await message.reply("❌ Error downloading video. Make sure the file is a valid video.")
+            embed = discord.Embed(
+                title="🎮 Rank Selection",
+                description="Choose your rank from the dropdown menu below.\n"
+                        "Your video will be submitted for moderation before appearing in guess-my-rank.",
+                color=0x00ff00
+            )
+            
+            await message.reply(embed=embed, view=view)
+            await message.remove_reaction('⏳', bot.user)
+            await message.add_reaction('✅')
         else:
-            await message.reply("📹 Please send a video (.mp4, .avi, .mov, etc.) to use the bot!")
+            await message.reply("The download failed !")
     
     else:
         # I know its not beautiful to watch
         if isinstance(message.channel, discord.DMChannel) and message.content != "!help":
-            await message.reply("Hi ! If you want Julian to treat your clip, just send a video(.mp4, .avi etc..)")
+            await message.reply("Hey! If you want Julian to treat your clip, just send a video(.mp4, .avi etc..)")
         if isinstance(message.channel, discord.DMChannel) and message.content != "!results":
-            await message.reply("Hi ! If you want Julian to treat your clip, just send a video(.mp4, .avi etc..)")
+            await message.reply("Hey! If you want Julian to treat your clip, just send a video(.mp4, .avi etc..)")
     # Process other commands
     await bot.process_commands(message)
 
@@ -964,6 +1012,9 @@ async def help_slash_command(interaction: discord.Interaction):
               "Approved clips get 24h voting period with automatic results",
         inline=False
     )
+    embed.set_footer(
+        text="Created by Vapoor • Python only • DM me for any issues"
+    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="results", description="Display last days results")
@@ -1022,6 +1073,7 @@ async def on_command_error(ctx, error):
 @bot.event
 async def on_error(event, *args, **kwargs):
     print(f"Bot error in {event}: {args}")
+    traceback.print_exc()
     
 
 if __name__ == "__main__":
