@@ -578,21 +578,21 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-i', input_path,
 
-            # Complex filter: blur left region and bottom center region
+            # Complex filter: blur all the spots
             '-filter_complex',
             f"[0:v]split=6[main][left_crop][bottom_crop][voice_crop][text_crop][replay_crop];"
-            f"[left_crop]crop={left_blur_width}:{left_blur_height}:{left_blur_x}:{left_blur_y},boxblur=lr=14:cr=6[left_blur];"
-            f"[bottom_crop]crop={bottom_blur_width}:{bottom_blur_height}:{bottom_blur_x}:{bottom_blur_y},boxblur=lr=14:cr=6[bottom_blur];"
-            f"[voice_crop]crop={voice_chat_width}:{voice_chat_height}:{voice_chat_x}:{voice_chat_y},boxblur=lr=14:cr=6[voice_blur];"
-            f"[text_crop]crop={text_chat_width}:{text_chat_height}:{text_chat_x}:{text_chat_y},boxblur=lr=14:cr=6[text_blur];"
-            f"[replay_crop]crop={replay_name_width}:{replay_name_height}:{replay_name_x}:{replay_name_y},boxblur=lr=14:cr=6[replay_blur];"
+            f"[left_crop]crop={left_blur_width}:{left_blur_height}:{left_blur_x}:{left_blur_y},boxblur=lr=12:cr=6[left_blur];"
+            f"[bottom_crop]crop={bottom_blur_width}:{bottom_blur_height}:{bottom_blur_x}:{bottom_blur_y},boxblur=lr=12:cr=6[bottom_blur];"
+            f"[voice_crop]crop={voice_chat_width}:{voice_chat_height}:{voice_chat_x}:{voice_chat_y},boxblur=lr=12:cr=6[voice_blur];"
+            f"[text_crop]crop={text_chat_width}:{text_chat_height}:{text_chat_x}:{text_chat_y},boxblur=lr=12:cr=6[text_blur];"
+            f"[replay_crop]crop={replay_name_width}:{replay_name_height}:{replay_name_x}:{replay_name_y},boxblur=lr=12:cr=6[replay_blur];"
             f"[main][left_blur]overlay={left_blur_x}:{left_blur_y}[tmp1];"
             f"[tmp1][bottom_blur]overlay={bottom_blur_x}:{bottom_blur_y}[tmp2];"
             f"[tmp2][voice_blur]overlay={voice_chat_x}:{voice_chat_y}[tmp3];"
             f"[tmp3][replay_blur]overlay={replay_name_x}:{replay_name_y}[tmp4];"
-            f"[tmp4][text_blur]overlay={text_chat_x}:{text_chat_y}[v]",
+            f"[tmp4][text_blur]overlay={text_chat_x}:{text_chat_y}[vout]",
 
-
+            '-map', '[vout]',
 
             # Video compression
             '-c:v', 'libx264',
@@ -948,9 +948,8 @@ async def on_raw_reaction_add(payload):
             json.dump(bot.pending_clips, f, indent=2)
 
     elif str(payload.emoji) == "❌":
-        moderator = guild.get_member(payload.user_id)
         await check_channel.send(
-            f"{moderator.mention}, please type the reason for rejecting this clip (within 5min):"
+            f"Please type the reason for rejecting this clip (within 5min):"
         )
 
         def check(msg):
