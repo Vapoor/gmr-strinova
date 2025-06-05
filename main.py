@@ -18,6 +18,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUESS_CHANNEL_NAME = 'guess-my-rank'
 CHECK_CHANNEL_NAME = 'check-clips'
+ROLE_PING = 'ROTD'
 CLIP_DATA_FILE = 'pending_clips.json'
 RESULTS_DATA_FILE = 'clip_results.json'
 video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
@@ -69,69 +70,67 @@ class ChannelSetupModal(discord.ui.Modal):
         self.add_item(self.check_channel_input)
         self.add_item(self.guess_channel_input)
     
-    async def on_submit(self, interaction: discord.Interaction):
-        check_channel_name = self.check_channel_input.value.strip()
-        guess_channel_name = self.guess_channel_input.value.strip()
-        
-        # Save conf
-        save_channel_config(interaction.guild.id, check_channel_name, guess_channel_name)
-        
-        # Create channel
-        created_channels = []
-        
-        # Verify and create
-        guess_channel = discord.utils.get(interaction.guild.channels, name=guess_channel_name)
-        if not guess_channel:
-            try:
-                guess_channel = await interaction.guild.create_text_channel(
-                    guess_channel_name,
-                    topic="🎮 Guess the rank of players from their videos!"
-                )
-                
-                welcome_embed = discord.Embed(
-                    title="🎮 Welcome to Guess My Rank!",
-                    description="In this channel, you'll see gameplay videos with the player's rank hidden.\n"
-                               "Try to guess their ranks, a reveal will appear 24h later.",
-                    color=0x00ff00
-                )
-                
-                await guess_channel.send(embed=welcome_embed)
-                created_channels.append(guess_channel_name)
-                
-            except discord.Forbidden:
-                await interaction.response.send_message("❌ I don't have permissions to create channels.", ephemeral=True)
-                return
-            except Exception as e:
-                await interaction.response.send_message(f"❌ Error creating {guess_channel_name}: {str(e)}", ephemeral=True)
-                return
-        
-        check_channel = discord.utils.get(interaction.guild.channels, name=check_channel_name)
-        if not check_channel:
-            try:
-                check_channel = await interaction.guild.create_text_channel(
-                    check_channel_name,
-                    topic="🔍 Moderation channel for clip submissions"
-                )
-                
-                instructions_embed = discord.Embed(
-                    title="🔍 Clip Moderation",
-                    description=("This channel is for moderating clip submissions.\n"
-                               "React with ✅ to approve clips or ❌ to reject them.\n"
-                               f"Approved clips will be automatically posted to **{GUESS_CHANNEL_NAME}**")
-                )
-                
-                await check_channel.send(embed=instructions_embed)
-                created_channels.append(check_channel_name)
-                
-            except Exception as e:
-                await interaction.response.send_message(f"❌ Error creating {check_channel_name}: {str(e)}", ephemeral=True)
-                return
-        
-        if created_channels:
-            channels_list = ", ".join([f"#{name}" for name in created_channels])
-            await interaction.response.send_message(f"✅ Channels configured and created: {channels_list}", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"✅ Channels configured: #{check_channel_name}, #{guess_channel_name}\n(Both channels already existed)", ephemeral=True)
+        async def on_submit(self, interaction: discord.Interaction):
+            check_channel_name = self.check_channel_input.value.strip()
+            guess_channel_name = self.guess_channel_input.value.strip()
+            
+            # Save config
+            save_channel_config(interaction.guild.id, check_channel_name, guess_channel_name)
+            
+            # Get existing channels
+            guess_channel = discord.utils.get(interaction.guild.channels, name=guess_channel_name)
+            check_channel = discord.utils.get(interaction.guild.channels, name=check_channel_name)
+            
+            # Update or create guess channel
+            guess_embed = discord.Embed(
+                title="🎮 Welcome to Guess My Rank!",
+                description="In this channel, you'll see gameplay videos with the player's rank hidden.\n"
+                        "Try to guess their ranks, a reveal will appear 24h later.",
+                color=0x00ff00
+            )
+            
+            if guess_channel:
+                # Delete old messages and send new one
+                await guess_channel.purge(limit=10)
+                await guess_channel.send(embed=guess_embed)
+            else:
+                try:
+                    guess_channel = await interaction.guild.create_text_channel(
+                        guess_channel_name,
+                        topic="🎮 Guess the rank of players from their videos!"
+                    )
+                    await guess_channel.send(embed=guess_embed)
+                except Exception as e:
+                    await interaction.response.send_message(f"❌ Error creating {guess_channel_name}: {str(e)}", ephemeral=True)
+                    return
+            
+            # Update or create check channel
+            check_embed = discord.Embed(
+                title="🔍 Clip Moderation",
+                description=("This channel is for moderating clip submissions.\n"
+                        "React with ✅ to approve clips or ❌ to reject them.\n"
+                        f"Approved clips will be automatically posted to **{guess_channel_name}**")
+            )
+            
+            if check_channel:
+                # Delete old messages and send new one
+                await check_channel.purge(limit=10)
+                await check_channel.send(embed=check_embed)
+            else:
+                try:
+                    check_channel = await interaction.guild.create_text_channel(
+                        check_channel_name,
+                        topic="🔍 Moderation channel for clip submissions"
+                    )
+                    await check_channel.send(embed=check_embed)
+                except Exception as e:
+                    await interaction.response.send_message(f"❌ Error creating {check_channel_name}: {str(e)}", ephemeral=True)
+                    return
+            
+            await interaction.response.send_message(
+                f"✅ Channels configured: #{check_channel_name}, #{guess_channel_name}",
+                ephemeral=True
+            )
 
 #####################################
 ####### RESULT SELECTOR #############
@@ -208,7 +207,57 @@ class ResultsSelector(discord.ui.View):
 
 
 
+#######################################
+##### REJECTION REASON MODAL #########
+#######################################
 
+class RejectionReasonModal(discord.ui.Modal):
+    def __init__(self, message_id: int, user_id: int):
+        super().__init__(title="Rejection Reason")
+        self.message_id = message_id
+        self.user_id = user_id
+        
+        self.reason_input = discord.ui.TextInput(
+            label="Reason for rejection",
+            placeholder="Enter the reason why this clip was rejected...",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=True
+        )
+        
+        self.add_item(self.reason_input)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = self.reason_input.value.strip()
+        
+        # Get the message and delete it
+        try:
+            message = await interaction.channel.fetch_message(self.message_id)
+            await message.delete()
+        except:
+            pass
+        
+        # Send rejection message to user
+        try:
+            user = bot.get_user(self.user_id)
+            if user:
+                rejection_embed = discord.Embed(
+                    title="❌ Clip Rejected",
+                    description=f"Your clip has been rejected by a moderator.\n\n**Reason:**\n{reason}",
+                    color=0xff0000
+                )
+                rejection_embed.set_footer(text="You can submit a new clip anytime!")
+                await user.send(embed=rejection_embed)
+        except Exception as e:
+            print(f"Error sending rejection message: {e}")
+        
+        # Remove from pending clips
+        if self.message_id in bot.pending_clips:
+            del bot.pending_clips[self.message_id]
+            with open(CLIP_DATA_FILE, 'w') as f:
+                json.dump(bot.pending_clips, f, indent=2)
+        
+        await interaction.response.send_message(f"✅ Clip rejected and user notified with reason: {reason}", ephemeral=True)
 
 
 
@@ -515,6 +564,11 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
         text_chat_height = 168
         text_chat_x = 25
         text_chat_y = 695
+        
+        replay_name_x = 730
+        replay_name_y = 1043
+        replay_name_width = 241
+        replay_name_height = 25
 
         # Step 2: Compute bitrate to hit target size
         target_bitrate_kbps = int((target_size_mb * 8192) / duration)
@@ -526,15 +580,18 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
 
             # Complex filter: blur left region and bottom center region
             '-filter_complex',
-            f"[0:v]split=5[main][left_crop][bottom_crop][voice_crop][text_crop];"
+            f"[0:v]split=6[main][left_crop][bottom_crop][voice_crop][text_crop][replay_crop];"
             f"[left_crop]crop={left_blur_width}:{left_blur_height}:{left_blur_x}:{left_blur_y},boxblur=lr=14:cr=6[left_blur];"
             f"[bottom_crop]crop={bottom_blur_width}:{bottom_blur_height}:{bottom_blur_x}:{bottom_blur_y},boxblur=lr=14:cr=6[bottom_blur];"
             f"[voice_crop]crop={voice_chat_width}:{voice_chat_height}:{voice_chat_x}:{voice_chat_y},boxblur=lr=14:cr=6[voice_blur];"
             f"[text_crop]crop={text_chat_width}:{text_chat_height}:{text_chat_x}:{text_chat_y},boxblur=lr=14:cr=6[text_blur];"
+            f"[replay_crop]crop={replay_name_width}:{replay_name_height}:{replay_name_x}:{replay_name_y},boxblur=lr=14:cr=6[replay_blur];"
             f"[main][left_blur]overlay={left_blur_x}:{left_blur_y}[tmp1];"
             f"[tmp1][bottom_blur]overlay={bottom_blur_x}:{bottom_blur_y}[tmp2];"
             f"[tmp2][voice_blur]overlay={voice_chat_x}:{voice_chat_y}[tmp3];"
-            f"[tmp3][text_blur]overlay={text_chat_x}:{text_chat_y}",
+            f"[tmp3][replay_blur]overlay={replay_name_x}:{replay_name_y}[tmp4];"
+            f"[tmp4][text_blur]overlay={text_chat_x}:{text_chat_y}[v]",
+
 
 
             # Video compression
@@ -858,6 +915,9 @@ async def on_raw_reaction_add(payload):
 
     if str(payload.emoji) == "✅":
         # Approve: forward the video with rank selector
+        
+        role = discord.utils.get(guild.roles, name=ROLE_PING)
+        role_mention = role.mention if role else "@Mods"
         if message.attachments:
             video = message.attachments[0]
             file = await video.to_file(filename=video.filename)
@@ -869,7 +929,7 @@ async def on_raw_reaction_add(payload):
             view = GuessRankSelector(clip_id, clip_data['rank'])
             
             await guess_channel.send(
-                f"🎮 **New Guess My Rank Clip!**\n\n"
+                f"🎮 **New Guess My Rank Clip!** {role_mention}\n\n"
                 f"Watch this video and guess the player's rank!\n"
                 f"You have 24 hours to vote.",
                 file=file,
@@ -888,21 +948,38 @@ async def on_raw_reaction_add(payload):
             json.dump(bot.pending_clips, f, indent=2)
 
     elif str(payload.emoji) == "❌":
-        # Reject: delete the message and notify
+        moderator = guild.get_member(payload.user_id)
+        await check_channel.send(
+            f"{moderator.mention}, please type the reason for rejecting this clip (within 5min):"
+        )
+
+        def check(msg):
+            return msg.author.id == payload.user_id and msg.channel.id == payload.channel_id
+
+        try:
+            reason_msg = await bot.wait_for("message", timeout=300.0, check=check)
+            user = bot.get_user(clip_data['user_id'])
+
+            if user:
+                try:
+                    await user.send(f"Your clip was rejected. Reason:\n> {reason_msg.content}")
+                except discord.Forbidden:
+                    await check_channel.send("❗ Couldn't send DM to the user.")
+            
+            # Optionally delete the mod's reason message for cleanliness
+            # await reason_msg.delete()
+
+        except asyncio.TimeoutError:
+            await check_channel.send("❗ No reason provided in time. Rejection canceled.")
+            return
+
+        # Delete the original clip message
         try:
             await message.delete()
         except:
             pass
-        
-        # Notify submitter if possible
-        try:
-            submitter = bot.get_user(clip_data['user_id'])
-            if submitter:
-                await submitter.send(f"❌ Your clip has been rejected by the moderators.")
-        except:
-            pass
-        
-        # Remove from pending clips
+
+        # Clean up clip record
         del bot.pending_clips[message_id]
         with open(CLIP_DATA_FILE, 'w') as f:
             json.dump(bot.pending_clips, f, indent=2)
