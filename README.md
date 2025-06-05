@@ -1,5 +1,5 @@
 # Guess My Rank (gmr) - Strinova Edition
-A discord bot allowing to setup a daily guess my rank clip with blur from a google forms (Strinova clip only)
+A discord bot allowing to create from zero a sort of guess-my-rank game on discord channels.
 
 ## How to setup
 - I would recommand running a Virtual Environment for the Setup, but it's up to you.
