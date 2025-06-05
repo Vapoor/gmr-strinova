@@ -255,129 +255,145 @@ class RankSelector(discord.ui.View):
     
     async def process_and_send_video(self, interaction: discord.Interaction):
         try:
-            #Check size
+            # Check file size
             original_size_mb = os.path.getsize(self.video_path) / (1024 * 1024)
-            
-            if original_size_mb > 200:  # check is > 200MB
+
+            if original_size_mb > 200:
                 await interaction.followup.send(
-                    f"❌ Video too large ({original_size_mb:.1f}MB)!\n",
-                    f"Please use a video smaller than 200MB.", 
+                    content=(
+                        f"❌ Video too large ({original_size_mb:.1f}MB)!\n"
+                        f"Please use a video smaller than 200MB."
+                    ),
                     ephemeral=True
                 )
                 cleanup_files([self.video_path])
                 return
-            
-            
+
             await interaction.followup.send(
-                f"🔄 Processing... (Video: {original_size_mb:.1f}MB)\n",
-                f"This may take a few minutes depending on size.\n",
-                f"If you using CatBox, please expect longer upload times (Maximum 15min before timeout)\n",
+                content=(
+                    f"🔄 Processing... (Video: {original_size_mb:.1f}MB)\n"
+                    f"This may take a few minutes depending on size.\n"
+                    f"If you're using CatBox, please expect longer upload times (maximum 15 minutes before timeout)."
+                ),
                 ephemeral=True
             )
-            
+
+            # Try to blur the video
             try:
-                #Blur video asynchrone
                 blurred_video_path = await asyncio.wait_for(
                     blur_video(self.video_path),
                     timeout=300  # 5 minutes
                 )
             except TimeoutError:
-                await interaction.followup.send("❌ Video processing took too long and timed out.", ephemeral=True)
+                await interaction.followup.send(
+                    content="❌ Video processing took too long and timed out.",
+                    ephemeral=True
+                )
                 cleanup_files([self.video_path])
                 return
-            # Check final size
+
             final_size_mb = os.path.getsize(blurred_video_path) / (1024 * 1024)
-            
-            if final_size_mb > 25:  # Discord limit
+
+            if final_size_mb > 25:
                 await interaction.followup.send(
-                    f"❌ Unable to compress video enough ({final_size_mb:.1f}MB)!\n"
-                    f"Please use a shorter video or lower quality.",
+                    content=(
+                        f"❌ Unable to compress video enough ({final_size_mb:.1f}MB)!\n"
+                        f"Please use a shorter video or lower quality."
+                    ),
                     ephemeral=True
                 )
                 cleanup_files([self.video_path, blurred_video_path])
                 return
-            
-           
+
+            # Find the moderation channel
             check_channel = None
             for guild in bot.guilds:
-                found_channel = discord.utils.get(guild.channels, name=CHECK_CHANNEL_NAME) #check if check-clips exist
+                found_channel = discord.utils.get(guild.channels, name=CHECK_CHANNEL_NAME)
                 if found_channel:
                     check_channel = found_channel
                     break
-            
+
             if not check_channel:
                 await interaction.followup.send(
-                    f"❌ Channel '{CHECK_CHANNEL_NAME}' not found!\n"
-                    f"Make sure a channel named '{CHECK_CHANNEL_NAME}' exists on a server where the bot is present.", 
+                    content=(
+                        f"❌ Channel '{CHECK_CHANNEL_NAME}' not found!\n"
+                        f"Make sure a channel named '{CHECK_CHANNEL_NAME}' exists on a server where the bot is present."
+                    ),
                     ephemeral=True
                 )
                 cleanup_files([self.video_path, blurred_video_path])
                 return
-            
-            # Send the video in the channel
+
+            # Send the clip to moderation
             with open(blurred_video_path, 'rb') as f:
                 file = discord.File(f, filename='guess_my_rank.mp4')
-                message_content = f"🎮 **Clip Submission for Review**\n\n" \
-                                f"Submitted by: {interaction.user.mention}\n" \
-                                f"Claimed rank: **{self.selected_rank}**\n\n" \
-                                f"React with ✅ to approve or ❌ to reject this clip."
-                
+                message_content = (
+                    f"🎮 **Clip Submission for Review**\n\n"
+                    f"Submitted by: {interaction.user.mention}\n"
+                    f"Claimed rank: **{self.selected_rank}**\n\n"
+                    f"React with ✅ to approve or ❌ to reject this clip."
+                )
+
                 moderation_message = await check_channel.send(message_content, file=file)
-                # Add reactions for moderation
                 await moderation_message.add_reaction("✅")
                 await moderation_message.add_reaction("❌")
-                
-                # Store clip data in message for later use
-                clip_data = {
-                    'rank': self.selected_rank,
-                    'user_id': interaction.user.id,
-                    'user_mention': interaction.user.mention
-                }
-                
-                # Load existing clip data (if any)
-                if not hasattr(bot, 'pending_clips'):
-                    if os.path.exists(CLIP_DATA_FILE):
-                        with open(CLIP_DATA_FILE, 'r') as f:
-                            bot.pending_clips = json.load(f)
-                            # Convert keys back to int since JSON stores them as strings
-                            bot.pending_clips = {int(k): v for k, v in bot.pending_clips.items()}
-                    else:
-                        bot.pending_clips = {}
 
-                # Add the new clip data
-                bot.pending_clips[moderation_message.id] = clip_data
+            # Store moderation data
+            clip_data = {
+                'rank': self.selected_rank,
+                'user_id': interaction.user.id,
+                'user_mention': interaction.user.mention
+            }
 
-                # Save to JSON file
-                with open(CLIP_DATA_FILE, 'w') as f:
-                    json.dump(bot.pending_clips, f, indent=2)
-            
-            # Confirm to user
+            if not hasattr(bot, 'pending_clips'):
+                if os.path.exists(CLIP_DATA_FILE):
+                    with open(CLIP_DATA_FILE, 'r') as f:
+                        bot.pending_clips = json.load(f)
+                        bot.pending_clips = {int(k): v for k, v in bot.pending_clips.items()}
+                else:
+                    bot.pending_clips = {}
+
+            bot.pending_clips[moderation_message.id] = clip_data
+
+            with open(CLIP_DATA_FILE, 'w') as f:
+                json.dump(bot.pending_clips, f, indent=2)
+
             await interaction.followup.send(
-                f"✅ Video submitted for moderation in {CHECK_CHANNEL_NAME}!\n"
-                f"Final size: {final_size_mb:.1f}MB\n"
-                f"Your clip will appear in guess-my-rank once approved by moderators.", 
+                content=(
+                    f"✅ Video submitted for moderation in `{CHECK_CHANNEL_NAME}`!\n"
+                    f"Final size: {final_size_mb:.1f}MB\n"
+                    f"Your clip will appear in #guess-my-rank once approved by moderators."
+                ),
                 ephemeral=True
             )
-            
-            # Clean up temp (to avoid losing 40GB of video lol)
+
             cleanup_files([self.video_path, blurred_video_path])
-            
+
         except discord.HTTPException as e:
-            if e.code == 40005:  # Payload too large
+            if e.code == 40005:
                 await interaction.followup.send(
-                    "❌ Video still too large after compression!\n"
-                    "Thats means that even after compression, you are still above 25MB.\n"
-                    "You can try to compress it yourself, or send a clip with lower resolution or shorter",
+                    content=(
+                        "❌ Video still too large after compression!\n"
+                        "That means that even after compression, you're still above 25MB.\n"
+                        "You can try to compress it yourself or send a clip with lower resolution or shorter duration."
+                    ),
                     ephemeral=True
                 )
             else:
-                await interaction.followup.send(f"❌ Discord error, please contact vaporr on discord with a screenshot", ephemeral=True)
+                await interaction.followup.send(
+                    content="❌ Discord error. Please contact vaporr on Discord with a screenshot.",
+                    ephemeral=True
+                )
             cleanup_files([self.video_path])
-            
+
         except Exception as e:
-            await interaction.followup.send(f"❌ Processing error, please contact vaporr on discord with a screenshot", ephemeral=True)
-            print(f"Processing Error : {e}")
+            await interaction.followup.send(
+                content="❌ Processing error. Please contact vaporr on Discord with a screenshot.",
+                ephemeral=True
+            )
+            print(f"Processing Error: {e}")
             cleanup_files([self.video_path])
+
 
 class GuessRankSelector(discord.ui.View):
     def __init__(self, clip_id: str, correct_rank: str):
