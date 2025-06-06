@@ -12,6 +12,7 @@ import tempfile
 from typing import List, Optional, Dict
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+from asyncio import Semaphore
 
 # Configuration
 load_dotenv()
@@ -22,6 +23,10 @@ ROLE_PING = 'ROTD'
 CLIP_DATA_FILE = 'pending_clips.json'
 RESULTS_DATA_FILE = 'clip_results.json'
 video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
+MAX_CONCURRENT_PROCESSING = 3 # Max threads to not blow ffmpeg 
+processing_semaphore = Semaphore(MAX_CONCURRENT_PROCESSING)
+processing_queue = [] # Tuple containing user_id / message of position
+CHANNEL_CONFIG_FILE = 'channel_config.json'
 
 RANKS = [
     {"name": "Singularity", "emoji": "<:Singularity:1379365129380036618>"},
@@ -86,7 +91,7 @@ class ChannelSetupModal(discord.ui.Modal):
                 title="🎮 Welcome to Guess My Rank!",
                 description="In this channel, you'll see gameplay videos with the player's rank hidden.\n"
                         "Try to guess their ranks, a reveal will appear 24h later.",
-                color=0x00ff00
+                color=0x7AB0E7
             )
             
             if guess_channel:
@@ -244,7 +249,7 @@ class RejectionReasonModal(discord.ui.Modal):
                 rejection_embed = discord.Embed(
                     title="❌ Clip Rejected",
                     description=f"Your clip has been rejected by a moderator.\n\n**Reason:**\n{reason}",
-                    color=0xff0000
+                    color=0x7AB0E7
                 )
                 rejection_embed.set_footer(text="You can submit a new clip anytime!")
                 await user.send(embed=rejection_embed)
@@ -304,138 +309,120 @@ class RankSelector(discord.ui.View):
     
     async def process_and_send_video(self, interaction: discord.Interaction):
         try:
-            # Check file size
+            # Check file size first (before queue)
             original_size_mb = os.path.getsize(self.video_path) / (1024 * 1024)
 
             if original_size_mb > 200:
                 await interaction.followup.send(
-                    content=(
-                        f"❌ Video too large ({original_size_mb:.1f}MB)!\n"
-                        f"Please use a video smaller than 200MB."
-                    ),
+                    content=f"❌ Video too large ({original_size_mb:.1f}MB)!\nPlease use a video smaller than 200MB.",
                     ephemeral=True
                 )
                 cleanup_files([self.video_path])
                 return
 
-            await interaction.followup.send(
-                content=(
-                    f"🔄 Processing... (Video: {original_size_mb:.1f}MB)\n"
-                    f"This may take a few minutes depending on size.\n"
-                    f"If you're using CatBox, please expect longer upload times (maximum 15 minutes before timeout)."
-                ),
-                ephemeral=True
-            )
-
-            # Try to blur the video
-            try:
-                blurred_video_path = await asyncio.wait_for(
-                    blur_video(self.video_path),
-                    timeout=300  # 5 minutes
-                )
-            except TimeoutError:
+            # Check if we need to queue
+            if processing_semaphore.locked() and len(processing_queue) == 0:
+                # First person to be queued
+                queue_position = await add_to_queue(self.user_id, interaction)
+            elif len(processing_queue) > 0:
+                # Others are waiting
+                queue_position = await add_to_queue(self.user_id, interaction)
+            
+            # Wait for our turn
+            async with processing_semaphore:
+                # Remove from queue when processing starts
+                await remove_from_queue(self.user_id)
+                
                 await interaction.followup.send(
-                    content="❌ Video processing took too long and timed out.",
+                    content=f"🔄 Now processing your video... ({original_size_mb:.1f}MB)\nThis may take a few minutes.",
                     ephemeral=True
                 )
-                cleanup_files([self.video_path])
-                return
 
-            final_size_mb = os.path.getsize(blurred_video_path) / (1024 * 1024)
+                # Your existing processing code continues here...
+                try:
+                    blurred_video_path = await asyncio.wait_for(
+                        blur_video(self.video_path),
+                        timeout=600
+                    )
+                except TimeoutError:
+                    await interaction.followup.send(
+                        content="❌ Video processing took too long and timed out.",
+                        ephemeral=True
+                    )
+                    cleanup_files([self.video_path])
+                    return
 
-            if final_size_mb > 25:
+                # Rest of your existing code remains the same...
+                final_size_mb = os.path.getsize(blurred_video_path) / (1024 * 1024)
+
+                if final_size_mb > 25:
+                    await interaction.followup.send(
+                        content=f"❌ Unable to compress video enough ({final_size_mb:.1f}MB)!\nPlease use a shorter video or lower quality.",
+                        ephemeral=True
+                    )
+                    cleanup_files([self.video_path, blurred_video_path])
+                    return
+
+                # Find the moderation channel (your existing code)
+                check_channel = None
+                for guild in bot.guilds:
+                    found_channel = discord.utils.get(guild.channels, name=CHECK_CHANNEL_NAME)
+                    if found_channel:
+                        check_channel = found_channel
+                        break
+
+                if not check_channel:
+                    await interaction.followup.send(
+                        content=f"❌ Channel '{CHECK_CHANNEL_NAME}' not found!",
+                        ephemeral=True
+                    )
+                    cleanup_files([self.video_path, blurred_video_path])
+                    return
+
+                # Send to moderation (your existing code)
+                with open(blurred_video_path, 'rb') as f:
+                    file = discord.File(f, filename='guess_my_rank.mp4')
+                    message_content = (
+                        f"🎮 **Clip Submission for Review**\n\n"
+                        f"Submitted by: {interaction.user.mention}\n"
+                        f"Claimed rank: **{self.selected_rank}**\n\n"
+                        f"React with ✅ to approve or ❌ to reject this clip."
+                    )
+
+                    moderation_message = await check_channel.send(message_content, file=file)
+                    await moderation_message.add_reaction("✅")
+                    await moderation_message.add_reaction("❌")
+
+                # Store moderation data (your existing code)
+                clip_data = {
+                    'rank': self.selected_rank,
+                    'user_id': interaction.user.id,
+                    'user_mention': interaction.user.mention
+                }
+
+                if not hasattr(bot, 'pending_clips'):
+                    if os.path.exists(CLIP_DATA_FILE):
+                        with open(CLIP_DATA_FILE, 'r') as f:
+                            bot.pending_clips = json.load(f)
+                            bot.pending_clips = {int(k): v for k, v in bot.pending_clips.items()}
+                    else:
+                        bot.pending_clips = {}
+
+                bot.pending_clips[moderation_message.id] = clip_data
+
+                with open(CLIP_DATA_FILE, 'w') as f:
+                    json.dump(bot.pending_clips, f, indent=2)
+
                 await interaction.followup.send(
-                    content=(
-                        f"❌ Unable to compress video enough ({final_size_mb:.1f}MB)!\n"
-                        f"Please use a shorter video or lower quality."
-                    ),
+                    content=f"✅ Video processed and submitted for moderation!\nFinal size: {final_size_mb:.1f}MB",
                     ephemeral=True
                 )
+
                 cleanup_files([self.video_path, blurred_video_path])
-                return
-
-            # Find the moderation channel
-            check_channel = None
-            for guild in bot.guilds:
-                found_channel = discord.utils.get(guild.channels, name=CHECK_CHANNEL_NAME)
-                if found_channel:
-                    check_channel = found_channel
-                    break
-
-            if not check_channel:
-                await interaction.followup.send(
-                    content=(
-                        f"❌ Channel '{CHECK_CHANNEL_NAME}' not found!\n"
-                        f"Make sure a channel named '{CHECK_CHANNEL_NAME}' exists on a server where the bot is present."
-                    ),
-                    ephemeral=True
-                )
-                cleanup_files([self.video_path, blurred_video_path])
-                return
-
-            # Send the clip to moderation
-            with open(blurred_video_path, 'rb') as f:
-                file = discord.File(f, filename='guess_my_rank.mp4')
-                message_content = (
-                    f"🎮 **Clip Submission for Review**\n\n"
-                    f"Submitted by: {interaction.user.mention}\n"
-                    f"Claimed rank: **{self.selected_rank}**\n\n"
-                    f"React with ✅ to approve or ❌ to reject this clip."
-                )
-
-                moderation_message = await check_channel.send(message_content, file=file)
-                await moderation_message.add_reaction("✅")
-                await moderation_message.add_reaction("❌")
-
-            # Store moderation data
-            clip_data = {
-                'rank': self.selected_rank,
-                'user_id': interaction.user.id,
-                'user_mention': interaction.user.mention
-            }
-
-            if not hasattr(bot, 'pending_clips'):
-                if os.path.exists(CLIP_DATA_FILE):
-                    with open(CLIP_DATA_FILE, 'r') as f:
-                        bot.pending_clips = json.load(f)
-                        bot.pending_clips = {int(k): v for k, v in bot.pending_clips.items()}
-                else:
-                    bot.pending_clips = {}
-
-            bot.pending_clips[moderation_message.id] = clip_data
-
-            with open(CLIP_DATA_FILE, 'w') as f:
-                json.dump(bot.pending_clips, f, indent=2)
-
-            await interaction.followup.send(
-                content=(
-                    f"✅ Video submitted for moderation in `{CHECK_CHANNEL_NAME}`!\n"
-                    f"Final size: {final_size_mb:.1f}MB\n"
-                    f"Your clip will appear in #guess-my-rank once approved by moderators."
-                ),
-                ephemeral=True
-            )
-
-            cleanup_files([self.video_path, blurred_video_path])
-
-        except discord.HTTPException as e:
-            if e.code == 40005:
-                await interaction.followup.send(
-                    content=(
-                        "❌ Video still too large after compression!\n"
-                        "That means that even after compression, you're still above 25MB.\n"
-                        "You can try to compress it yourself or send a clip with lower resolution or shorter duration."
-                    ),
-                    ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    content="❌ Discord error. Please contact vaporr on Discord with a screenshot.",
-                    ephemeral=True
-                )
-            cleanup_files([self.video_path])
 
         except Exception as e:
+            # Make sure to remove from queue on error
+            await remove_from_queue(self.user_id)
             await interaction.followup.send(
                 content="❌ Processing error. Please contact vaporr on Discord with a screenshot.",
                 ephemeral=True
@@ -502,14 +489,33 @@ class GuessRankSelector(discord.ui.View):
             f"The rank in the clip was **{self.correct_rank}**", 
             ephemeral=True
         )
+        
+def get_video_resolution(path):
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height',
+        '-of', 'json',
+        path
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    info = json.loads(result.stdout)
+    width = info['streams'][0]['width']
+    height = info['streams'][0]['height']
+    return width, height
+
+import os
+import json
+import tempfile
+import asyncio
 
 async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
     """Apply adaptive blur and compress video using FFmpeg."""
-    
     # Create temporary output file
     output_fd, output_path = tempfile.mkstemp(suffix='.mp4')
     os.close(output_fd)
 
+    # FFprobe to get video info
     try:
         probe_cmd = [
             'ffprobe', '-v', 'quiet', '-print_format', 'json',
@@ -525,94 +531,85 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
             raise Exception(f"FFprobe failed: {stderr.decode()}")
 
         probe_data = json.loads(stdout.decode())
-        
-        # Get video stream info
-        video_stream = None
-        for stream in probe_data['streams']:
-            if stream['codec_type'] == 'video':
-                video_stream = stream
-                break
-        
+
+        # Extract resolution and duration
+        video_stream = next((s for s in probe_data['streams'] if s['codec_type'] == 'video'), None)
         if not video_stream:
             raise Exception("No video stream found")
-        
-        duration = float(probe_data['format']['duration'])
+
         width = int(video_stream['width'])
         height = int(video_stream['height'])
-        
-        # Here we got all the blur regions
-        # left_blur -> kill feed
-        # bottom blur -> replay nickname
-        # voice chat -> self-explanatory
-        # text_chat -> self-explanatory
-        left_blur_x = 103
-        left_blur_y = 98
-        left_blur_width = 333
-        left_blur_height = 240
-        
-        bottom_blur_width = 293
-        bottom_blur_height = 28
-        bottom_blur_x = 764
-        bottom_blur_y = 1032
+        duration = float(probe_data['format']['duration'])
 
-        voice_chat_width = 229
-        voice_chat_height = 188
-        voice_chat_x = 38
-        voice_chat_y = 417
-
-        text_chat_width = 425
-        text_chat_height = 168
-        text_chat_x = 25
-        text_chat_y = 695
-        
-        replay_name_x = 730
-        replay_name_y = 1043
-        replay_name_width = 241
-        replay_name_height = 25
-
-        # Step 2: Compute bitrate to hit target size
+        # Compute bitrate
         target_bitrate_kbps = int((target_size_mb * 8192) / duration)
-        target_bitrate_kbps = max(500, min(target_bitrate_kbps, 5000))  # Clamp to reasonable range
+        target_bitrate_kbps = max(500, min(target_bitrate_kbps, 5000))
 
-        # Step 3: Build FFmpeg command with adaptive blur
-        ffmpeg_cmd = [
-            'ffmpeg', '-y', '-i', input_path,
+        # Build base FFmpeg command
+        ffmpeg_cmd = ['ffmpeg', '-y', '-i', input_path]
 
-            # Complex filter: blur all the spots
-            '-filter_complex',
-            f"[0:v]split=6[main][left_crop][bottom_crop][voice_crop][text_crop][replay_crop];"
-            f"[left_crop]crop={left_blur_width}:{left_blur_height}:{left_blur_x}:{left_blur_y},boxblur=lr=12:cr=6[left_blur];"
-            f"[bottom_crop]crop={bottom_blur_width}:{bottom_blur_height}:{bottom_blur_x}:{bottom_blur_y},boxblur=lr=12:cr=6[bottom_blur];"
-            f"[voice_crop]crop={voice_chat_width}:{voice_chat_height}:{voice_chat_x}:{voice_chat_y},boxblur=lr=12:cr=6[voice_blur];"
-            f"[text_crop]crop={text_chat_width}:{text_chat_height}:{text_chat_x}:{text_chat_y},boxblur=lr=12:cr=6[text_blur];"
-            f"[replay_crop]crop={replay_name_width}:{replay_name_height}:{replay_name_x}:{replay_name_y},boxblur=lr=12:cr=6[replay_blur];"
-            f"[main][left_blur]overlay={left_blur_x}:{left_blur_y}[tmp1];"
-            f"[tmp1][bottom_blur]overlay={bottom_blur_x}:{bottom_blur_y}[tmp2];"
-            f"[tmp2][voice_blur]overlay={voice_chat_x}:{voice_chat_y}[tmp3];"
-            f"[tmp3][replay_blur]overlay={replay_name_x}:{replay_name_y}[tmp4];"
-            f"[tmp4][text_blur]overlay={text_chat_x}:{text_chat_y}[vout]",
+        # Conditional blur
+        if width == 1920 and height == 1080:
+            # Blur parameters
+            left_blur_x = 103
+            left_blur_y = 98
+            left_blur_width = 333
+            left_blur_height = 240
 
-            '-map', '[vout]',
+            bottom_blur_width = 293
+            bottom_blur_height = 28
+            bottom_blur_x = 764
+            bottom_blur_y = 1032
 
-            # Video compression
+            voice_chat_width = 198
+            voice_chat_height = 502
+            voice_chat_x = 38
+            voice_chat_y = 357
+
+            text_chat_width = 425
+            text_chat_height = 168
+            text_chat_x = 25
+            text_chat_y = 695
+
+            replay_name_x = 730
+            replay_name_y = 1043
+            replay_name_width = 241
+            replay_name_height = 25
+
+            # Filter complex for blur
+            filter_complex = (
+                f"[0:v]split=6[main][left_crop][bottom_crop][voice_crop][text_crop][replay_crop];"
+                f"[left_crop]crop={left_blur_width}:{left_blur_height}:{left_blur_x}:{left_blur_y},boxblur=lr=12:cr=6[left_blur];"
+                f"[bottom_crop]crop={bottom_blur_width}:{bottom_blur_height}:{bottom_blur_x}:{bottom_blur_y},boxblur=lr=12:cr=6[bottom_blur];"
+                f"[voice_crop]crop={voice_chat_width}:{voice_chat_height}:{voice_chat_x}:{voice_chat_y},boxblur=lr=12:cr=6[voice_blur];"
+                f"[text_crop]crop={text_chat_width}:{text_chat_height}:{text_chat_x}:{text_chat_y},boxblur=lr=12:cr=6[text_blur];"
+                f"[replay_crop]crop={replay_name_width}:{replay_name_height}:{replay_name_x}:{replay_name_y},boxblur=lr=12:cr=6[replay_blur];"
+                f"[main][left_blur]overlay={left_blur_x}:{left_blur_y}[tmp1];"
+                f"[tmp1][bottom_blur]overlay={bottom_blur_x}:{bottom_blur_y}[tmp2];"
+                f"[tmp2][voice_blur]overlay={voice_chat_x}:{voice_chat_y}[tmp3];"
+                f"[tmp3][replay_blur]overlay={replay_name_x}:{replay_name_y}[tmp4];"
+                f"[tmp4][text_blur]overlay={text_chat_x}:{text_chat_y}[vout]"
+            )
+
+            ffmpeg_cmd += ['-filter_complex', filter_complex, '-map', '[vout]']
+        else:
+            ffmpeg_cmd += ['-map', '0:v']
+
+        # Final encoding settings
+        ffmpeg_cmd += [
             '-c:v', 'libx264',
             '-preset', 'medium',
             '-crf', '22',
-            '-maxrate', '2500k', # the higher is it, the better the quality
-            '-bufsize', '5000k', # bufsize ALWAYS x2 the maxrate
-
-            # Audio
+            '-maxrate', f'{target_bitrate_kbps}k',
+            '-bufsize', f'{2 * target_bitrate_kbps}k',
             '-c:a', 'aac',
             '-b:a', '128k',
-
-            # Format tuning
             '-pix_fmt', 'yuv420p',
             '-movflags', '+faststart',
-
             output_path
         ]
 
-        # Step 4: Run FFmpeg
+        # Execute FFmpeg
         proc = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -622,25 +619,92 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
         if proc.returncode != 0:
             raise Exception(f"FFmpeg failed: {stderr.decode()}")
 
-        # Step 5: Report result
-        final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"Blurred and compressed: {input_path} -> {final_size_mb:.2f} MB at {target_bitrate_kbps} kbps")
-        print(f"Video dimensions: {width}x{height}")
-        print(f"Left blur region: {left_blur_width}x{left_blur_height}")
-        print(f"Bottom blur region: {bottom_blur_width}x{bottom_blur_height} at ({bottom_blur_x}, {bottom_blur_y})")
+        print(f"Output video size: {os.path.getsize(output_path) / (1024 * 1024):.2f} MB")
         return output_path
 
     except Exception as e:
         if os.path.exists(output_path):
             os.remove(output_path)
         raise e
-    
-    
-#################
-### UTILS #######
-#################
 
-CHANNEL_CONFIG_FILE = 'channel_config.json'
+    
+#####################################################################################
+#################################### UTILS ##########################################
+#####################################################################################
+
+async def add_to_queue(user_id: int, interaction: discord.Interaction) -> int:
+    """Add user to processing queue and return their position"""
+    position = len(processing_queue) + 1
+    
+    # Send initial queue message
+    queue_embed = discord.Embed(
+        title="⏳ Added to Processing Queue",
+        description=f"You are **#{position}** in the queue.\nProcessing up to {MAX_CONCURRENT_PROCESSING} videos simultaneously.",
+        color=0x7AB0E7
+    )
+    
+    try:
+        message = await interaction.followup.send(embed=queue_embed, ephemeral=True)
+        processing_queue.append((user_id, message))
+        
+        # Start background task to update queue position
+        asyncio.create_task(update_queue_position(user_id))
+        
+        return position
+    except:
+        return position
+
+async def remove_from_queue(user_id: int):
+    """Remove user from queue and update positions for others"""
+    global processing_queue
+    
+    # Remove user from queue
+    processing_queue = [(uid, msg) for uid, msg in processing_queue if uid != user_id]
+    
+    # Update positions for remaining users
+    for i, (uid, message) in enumerate(processing_queue):
+        new_position = i + 1
+        try:
+            queue_embed = discord.Embed(
+                title="⏳ Queue Position Updated",
+                description=f"You are now **#{new_position}** in the queue.\nProcessing up to {MAX_CONCURRENT_PROCESSING} videos simultaneously.",
+                color=0x7AB0E7
+            )
+            await message.edit(embed=queue_embed)
+        except:
+            pass  # Message might be deleted or expired
+
+async def update_queue_position(user_id: int):
+    """Background task to update queue position every 2 minutes"""
+    while True:
+        await asyncio.sleep(120)  # 2 minutes
+        
+        # Find user in queue
+        user_found = False
+        for i, (uid, message) in enumerate(processing_queue):
+            if uid == user_id:
+                user_found = True
+                position = i + 1
+                try:
+                    queue_embed = discord.Embed(
+                        title="⏳ Queue Position Update",
+                        description=f"You are **#{position}** in the queue.\nProcessing up to {MAX_CONCURRENT_PROCESSING} videos simultaneously.\n\n*Updated every 2 minutes*",
+                        color=0x7AB0E7
+                    )
+                    await message.edit(embed=queue_embed)
+                except:
+                    pass  # Message might be deleted
+                break
+        
+        if not user_found:
+            break  # User no longer in queue, stop updating
+
+async def get_queue_position(user_id: int) -> int:
+    """Get current queue position for user"""
+    for i, (uid, _) in enumerate(processing_queue):
+        if uid == user_id:
+            return i + 1
+    return 0
 
 
 async def download_video_from_url(url: str, max_size_mb: int = 100) -> str | None:
@@ -782,7 +846,7 @@ def get_results_embed(clip_id: str) -> discord.Embed:
     embed = discord.Embed(
         title="🎯 Results - Guess My Rank",
         description=f"**Correct Rank:** {correct_rank}\n**Total Votes:** {total_votes}",
-        color=0x00ff00
+        color=0x7AB0E7
     )
     
     # Calculate percentages
@@ -916,8 +980,8 @@ async def on_raw_reaction_add(payload):
     if str(payload.emoji) == "✅":
         # Approve: forward the video with rank selector
         
-        role = discord.utils.get(guild.roles, name=ROLE_PING)
-        role_mention = role.mention if role else "@Mods"
+        role = discord.utils.get(guild.roles, name={ROLE_PING})
+        role_mention = role.mention if role else "" # Ping the Role if Found else nothing
         if message.attachments:
             video = message.attachments[0]
             file = await video.to_file(filename=video.filename)
@@ -1020,7 +1084,7 @@ async def on_message(message):
                 title="🎮 Rank Selection",
                 description="Choose your rank from the dropdown menu below.\n"
                         "Your video will be submitted for moderation before appearing in guess-my-rank.",
-                color=0x00ff00
+                color=0x7AB0E7
             )
             
             await message.reply(embed=embed, view=view)
@@ -1055,7 +1119,7 @@ async def setup_channels(interaction : discord.Interaction):
                    f"• Check channel: `{check_channel_name}`\n"
                    f"• Guess channel: `{guess_channel_name}`\n\n"
                    f"Click the button below to modify the configuration.",
-        color=0x0099ff
+        color=0x7AB0E7
     )
     
     class SetupView(discord.ui.View):
@@ -1074,7 +1138,7 @@ async def help_slash_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🤖 Guess My Rank Bot - Help",
         description="This bot allows you to create rank guessing challenges!",
-        color=0x0099ff
+        color=0x7AB0E7
     )
     embed.add_field(
         name="📱 How to use:",
@@ -1120,7 +1184,7 @@ async def show_results(interaction : discord.Interaction):
         embed = discord.Embed(
             title="📊 No Results Available",
             description="No finished clips found yet. Wait for some clips to complete their 24-hour voting period!",
-            color=0xff9900
+            color=0x7AB0E7
         )
         await interaction.response.send_message(embed=embed)
         return
@@ -1128,7 +1192,7 @@ async def show_results(interaction : discord.Interaction):
     embed = discord.Embed(
         title="📊 Browse Clip Results",
         description="Select a clip from the dropdown menu below to view its results.",
-        color=0x0099ff
+        color=0x7AB0E7
     )
     
     view = ResultsSelector()
