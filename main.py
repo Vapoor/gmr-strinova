@@ -43,6 +43,8 @@ RANKS = [
     {"name": "Substance", "emoji": "<:Substance:1379365131129192488>"}
 ]
 
+RANK_EMOJIS = {rank["name"]: rank["emoji"] for rank in RANKS}
+
 # Bot configuration
 intents = discord.Intents.default()
 intents.message_content = True
@@ -198,28 +200,31 @@ class ChannelSetupModal(discord.ui.Modal):
 #####################################
 
 class ResultsSelector(discord.ui.View):
-    def __init__(self):
+    def __init__(self, guild_id: int):
         super().__init__(timeout=60)
+        self.guild_id = guild_id
         
         # Take all the clips that are dones
         results_data = load_results_data()
         finished_clips = []
         
-        for clip_id, clip_data in results_data.items():
-            if clip_data['expired']:
-                end_time = datetime.fromisoformat(clip_data['end_time'])
-                date_str = end_time.strftime("%Y-%m-%d %H:%M")
-                rank_emoji = next((rank['emoji'] for rank in RANKS if rank['name'] == clip_data['correct_rank']), '🎮')
-                
-                finished_clips.append({
-                    'clip_id': clip_id,
-                    'date': date_str,
-                    'rank': clip_data['correct_rank'],
-                    'emoji': rank_emoji,
-                    'votes': clip_data['total_votes']
-                })
+        if guild_id in results_data:
+            server_clips = results_data[guild_id]
+            for clip_id, clip_data in server_clips.items():
+                if clip_data.get('expired', False):
+                    end_time = datetime.fromisoformat(clip_data['end_time'])
+                    date_str = end_time.strftime("%Y-%m-%d %H:%M")
+                    rank_emoji = next((rank['emoji'] for rank in RANKS if rank['name'] == clip_data.get('correct_rank', '')), '🎮')
+                    
+                    finished_clips.append({
+                        'clip_id': clip_id,
+                        'date': date_str,
+                        'rank': clip_data.get('correct_rank', 'Unknown'),
+                        'emoji': rank_emoji,
+                        'votes': clip_data.get('total_votes', 0)
+                    })
         
-        # SortByDate
+        # Sort by date (newest first)
         finished_clips.sort(key=lambda x: x['date'], reverse=True)
         
         if not finished_clips:
@@ -258,7 +263,7 @@ class ResultsSelector(discord.ui.View):
             return
         
         clip_id = self.clip_select.values[0]
-        results_embed = get_results_embed(clip_id)
+        results_embed = get_results_embed(clip_id, self.guild_id)
         
         if results_embed:
             results_embed.set_footer(text=f"Clip ID: {clip_id}")
@@ -484,11 +489,8 @@ class RankSelector(discord.ui.View):
                 if self.guild_id not in bot.pending_clips:
                     bot.pending_clips[self.guild_id] = {}
 
-                # Store under the server ID
+                # Store under the message ID
                 bot.pending_clips[self.guild_id][str(moderation_message.id)] = clip_data
-
-                with open(CLIP_DATA_FILE, 'w') as f:
-                    json.dump(bot.pending_clips, f, indent=2)
 
                 with open(CLIP_DATA_FILE, 'w') as f:
                     json.dump(bot.pending_clips, f, indent=2)
@@ -513,22 +515,23 @@ class RankSelector(discord.ui.View):
 
 class GuessRankSelector(discord.ui.View):
     def __init__(self, clip_id: str, correct_rank: str):
-        super().__init__(timeout=86400)  # 24 hours timeout
+        super().__init__(timeout=None)  # 24 hours timeout
         self.clip_id = clip_id
         self.correct_rank = correct_rank
         
         # Create rank options using the RANK_EMOJIS dictionary
         rank_options = []
-        for rank, emoji in RANK_EMOJIS.items():
+        for rank in RANKS:
             rank_options.append(
-                discord.SelectOption(label=rank, value=rank, emoji=emoji)
+                discord.SelectOption(label=rank["name"], value=rank["name"], emoji=rank["emoji"])
             )
         
         self.rank_select = discord.ui.Select(
             placeholder="Select your rank guess...",
             min_values=1,
             max_values=1,
-            options=rank_options
+            options=rank_options,
+            custom_id=f"rank_select_{clip_id}"
         )
         self.rank_select.callback = self.guess_callback
         self.add_item(self.rank_select)
@@ -599,6 +602,38 @@ class GuessRankSelector(discord.ui.View):
             ephemeral=True
         )
     
+    async def disable_view_in_message(self, guild_id: int):
+        """Disable the view when the voting period expires"""
+        try:
+            # Find the message and disable the view
+            results_data = load_results_data()
+            if guild_id in results_data and self.clip_id in results_data[guild_id]:
+                clip_data = results_data[guild_id][self.clip_id]
+                message_id = clip_data.get('message_id')
+                
+                if message_id:
+                    guild = bot.get_guild(guild_id)
+                    if guild:
+                        _, guess_channel_name, _ = get_channel_names(guild_id)
+                        guess_channel = discord.utils.get(guild.channels, name=guess_channel_name)
+                        
+                        if guess_channel:
+                            try:
+                                message = await guess_channel.fetch_message(message_id)
+                                # Disable all items in the view
+                                for item in self.children:
+                                    item.disabled = True
+                                
+                                # Update the message with disabled view
+                                await message.edit(view=self)
+                            except discord.NotFound:
+                                pass  # Message was deleted
+                            except Exception as e:
+                                print(f"Error disabling view: {e}")
+        except Exception as e:
+            print(f"Error in disable_view_in_message: {e}")
+
+
     async def on_timeout(self):
         """Handle when the view times out (24 hours)"""
         guild_id = None
@@ -885,16 +920,17 @@ def save_vote(clip_id: str, guessed_rank: str, user_id: int):
     save_results_data(results_data)
     return True
 
-def get_results_embed(clip_id: str) -> discord.Embed:
-    """Generate results embed with percentages"""
+def get_results_embed(clip_id: str, guild_id: int) -> discord.Embed:
+    """Generate results embed with percentages for a specific server"""
     results_data = load_results_data()
-    clip_data = results_data.get(clip_id)
     
-    if not clip_data:
+    # Check if server and clip exist
+    if guild_id not in results_data or clip_id not in results_data[guild_id]:
         return None
     
-    correct_rank = clip_data['correct_rank']
-    total_votes = clip_data['total_votes']
+    clip_data = results_data[guild_id][clip_id]
+    correct_rank = clip_data.get('correct_rank', 'Unknown')
+    total_votes = clip_data.get('total_votes', 0)
     
     embed = discord.Embed(
         title="🎯 Results - Guess The Rank",
@@ -902,11 +938,13 @@ def get_results_embed(clip_id: str) -> discord.Embed:
         color=0x7AB0E7
     )
     
-    # Calculate percentages
+    # Calculate percentages from vote data
+    votes_data = clip_data.get('votes', {})
     results_text = ""
+    
     for rank in RANKS:
         rank_name = rank['name']
-        votes_count = len(clip_data['votes'].get(rank_name, []))
+        votes_count = votes_data.get(rank_name, 0)
         percentage = (votes_count / total_votes * 100) if total_votes > 0 else 0
         
         emoji = rank['emoji']
@@ -920,38 +958,72 @@ def get_results_embed(clip_id: str) -> discord.Embed:
     return embed
 
 async def register_persistent_views():
-    results_data = load_results_data()
-    for clip_id, clip in results_data.items():
-        if not clip['expired']:
-            bot.add_view(GuessRankSelector(clip_id, clip['correct_rank']))
-
-async def check_expired_clips():
-    """Check for expired clips and post results"""
+    """Register persistent views for all active clips across all servers"""
     results_data = load_results_data()
     current_time = datetime.now()
     
-    for clip_id, clip_data in results_data.items():
-        if clip_data['expired']:
-            continue
-            
-        end_time = datetime.fromisoformat(clip_data['end_time'])
-        
-        if current_time > end_time:
-            # Mark as expired
-            clip_data['expired'] = True
-            
-            # Find the results channel and post results
-            for guild in bot.guilds:
-                _, _, results_channel_name = get_channel_names(guild.id)
-                results_channel = discord.utils.get(guild.channels, name=results_channel_name)
+    for guild_id, server_clips in results_data.items():
+        for clip_id, clip_data in server_clips.items():
+            # Only register views for clips that haven't expired
+            if not clip_data.get('expired', False):
+                try:
+                    # Double-check if the clip should have expired by now
+                    end_time = datetime.fromisoformat(clip_data['end_time'])
+                    if current_time <= end_time:
+                        # Clip is still active, register the view
+                        view = GuessRankSelector(clip_id, clip_data.get('correct_rank', 'Unknown'))
+                        bot.add_view(view)
+                        print(f"Registered persistent view for clip {clip_id} in guild {guild_id}")
+                    else:
+                        # Clip should have expired, mark it as such
+                        clip_data['expired'] = True
+                        print(f"Marked clip {clip_id} as expired during registration")
+                except Exception as e:
+                    print(f"Error registering view for clip {clip_id}: {e}")
+    
+    # Save any changes made during registration
+    save_results_data(results_data)
+
+async def check_expired_clips():
+    """Check for expired clips and post results for each server"""
+    results_data = load_results_data()
+    current_time = datetime.now()
+    
+    for guild_id, server_clips in results_data.items():
+        for clip_id, clip_data in server_clips.items():
+            if clip_data.get('expired', False):
+                continue
                 
-                if results_channel:
-                    results_embed = get_results_embed(clip_id)
-                    if results_embed:
-                        await results_channel.send(embed=results_embed)
-                    break
+            end_time = datetime.fromisoformat(clip_data['end_time'])
+            
+            if current_time > end_time:
+                # Mark as expired
+                clip_data['expired'] = True
+                
+                # Disable the voting view
+                try:
+                    # Create a temporary view instance to disable it
+                    temp_view = GuessRankSelector(clip_id, clip_data.get('correct_rank', 'Unknown'))
+                    await temp_view.disable_view_in_message(guild_id)
+                except Exception as e:
+                    print(f"Error disabling view for clip {clip_id}: {e}")
+                
+                # Find the results channel for this specific server
+                guild = bot.get_guild(guild_id)
+                if guild:
+                    _, _, results_channel_name = get_channel_names(guild.id)
+                    results_channel = discord.utils.get(guild.channels, name=results_channel_name)
+                    
+                    if results_channel:
+                        results_embed = get_results_embed(clip_id, guild_id)
+                        if results_embed:
+                            try:
+                                await results_channel.send(embed=results_embed)
+                            except Exception as e:
+                                print(f"Error posting results to {guild.name}: {e}")
     
     save_results_data(results_data)
+
 
 async def save_video_from_attachment(attachment: discord.Attachment) -> Optional[str]:
     """Download and save video from Discord attachment"""
@@ -1231,7 +1303,6 @@ async def on_raw_reaction_add(payload):
                 )
                 embed.add_field(name="🎬 Video", value=f"[Watch Video]({video_url})", inline=False)
                 embed.add_field(name="⏰ Voting Time", value="24 hours", inline=True)
-                embed.add_field(name="📊 Current Votes", value="0", inline=True)
                 embed.set_footer(text="Select your guess from the dropdown below!")
                 
                 guess_message = await guess_channel.send(embed=embed)
@@ -1325,7 +1396,7 @@ async def on_raw_reaction_add(payload):
             pass
 
         # Remove from pending clips for this server
-        del bot.pending_clips[guild.id][message_id]
+        del bot.pending_clips[guild.id][str(message_id)]
         with open(CLIP_DATA_FILE, 'w') as f:
             json.dump(bot.pending_clips, f, indent=2)
 
@@ -1399,7 +1470,7 @@ async def on_raw_reaction_add(payload):
             pass
 
         # Clean up server-specific clip record
-        del bot.pending_clips[guild.id][message_id]
+        del bot.pending_clips[guild.id][str(message_id)]
         with open(CLIP_DATA_FILE, 'w') as f:
             json.dump(bot.pending_clips, f, indent=2)
 @bot.event
@@ -1500,10 +1571,9 @@ async def on_message(message):
                 "**Available servers:**\n"
                 f"{server_text}\n\n"
                 "**Supported methods:**\n"
-                "• Upload a video file (MP4, AVI, MOV, etc.)\n"
+                "• Upload a video file (MP4, AVI, MOV, etc.) with embed File\n"
                 "• Send a catbox.moe link\n"
-                "• Send a Discord CDN link\n"
-                "• Send any direct video URL\n\n"
+                "## Normal URL or CDN Discord is not handled\n"
                 "**File size limit:** 200MB"
             )
     
@@ -1571,7 +1641,7 @@ async def help_slash_command(interaction: discord.Interaction):
     )
     embed.add_field(
         name="📱 How to submit clips:",
-        value="1. Send me a video in private message (DM)\n"
+        value="1. Send me a video in private message (DM), either catbox link or normal embed link, other methodes will NOT work!\n"
               "2. Select your rank from the dropdown menu\n"
               "3. Your video will be processed and submitted for moderation\n"
               "4. Once approved, it will appear in the guess channel with voting\n"
@@ -1609,15 +1679,21 @@ async def help_slash_command(interaction: discord.Interaction):
 
 @tree.command(name="results", description="Display results from completed clips")
 async def show_results(interaction: discord.Interaction):
-    """Show results browser for finished clips"""
+    """Show results browser for finished clips in this server"""
     
+    guild_id = interaction.guild.id
     results_data = load_results_data()
-    finished_clips = [clip_id for clip_id, clip_data in results_data.items() if clip_data['expired']]
+    
+    # Check if this server has any results
+    finished_clips = []
+    if guild_id in results_data:
+        server_clips = results_data[guild_id]
+        finished_clips = [clip_id for clip_id, clip_data in server_clips.items() if clip_data.get('expired', False)]
     
     if not finished_clips:
         embed = discord.Embed(
             title="📊 No Results Available",
-            description="No finished clips found yet. Wait for some clips to complete their 24-hour voting period!",
+            description="No finished clips found yet for this server. Wait for some clips to complete their 24-hour voting period!",
             color=0x7AB0E7
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1629,7 +1705,7 @@ async def show_results(interaction: discord.Interaction):
         color=0x7AB0E7
     )
     
-    view = ResultsSelector()
+    view = ResultsSelector(guild_id)
     await interaction.response.send_message(embed=embed, view=view)
 
 @tree.command(name="cleanup", description="Delete expired clips from this server's database")

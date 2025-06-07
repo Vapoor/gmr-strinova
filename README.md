@@ -16,6 +16,7 @@ pip install -r requirements.txt
 - **/setup** (Admin only)
 - **/results**
 - **/help**
+- **/cleanup**
 
 ## What he can do :
 - Receiving a clip until **200MB**, using either default discord embed files, or catbox website
@@ -23,18 +24,17 @@ pip install -r requirements.txt
 - After getting compressed using FFMPEG (3 threads max aka 3 rendering clip at the same time maximum to avoid burning GPU / RAM), the clip goes to the channel that got setup by the mods.
 - The clip can either be accepted or rejected, if rejected, its deleted from the channel, if accepted, its deleted and moved to guess-the-rank channel, where you can see the clip, people have 24h to lock their guesses, after locking 1 guess, the guess is locked forever, the user instantly have the rank after the 1st guess.
 - 24h Later, a small chart with percent is droped, showing how the rank distribution went.
+- user can cleanup the oldest clip (only for PC performance, doesnt affect anything for user UI because of 25 dropdown limit)
 
 ## Known Issues
-- For mods, when rejecting / accepting clips, the user at the start has no clue if its was accepted or not, or still waiting, I can maybe create a command /status that would show for each id all theirs current clip, with status Accepted / Refused / In process
-- No CDN handling for clips but its not that important for now
 - **ALL THE CODE** is in the same file
-- @ROTD not getting pinged somehow
+- Some Json shenarigans happening when deleting data, not affection the algorithm but still weird to see.
 
 ## What Im working On soon
-- /cleanup for admins to delete old clips, because for now all the clips datas are saved in a file, its not that heavy because its only text with json, but can grow quickly
+- Break time.
 
 ## Authors
 - Vapoor
-- Help of Walerchik
+
 
 
