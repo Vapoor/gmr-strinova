@@ -1116,42 +1116,45 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
         # Build base FFmpeg command
         ffmpeg_cmd = ['ffmpeg', '-y', '-i', input_path]
 
-        # Conditional blur
-        if width == 1920 and height == 1080:
-            # Blur parameters
-            left_blur_x = 103
-            left_blur_y = 98
-            left_blur_width = 333
-            left_blur_height = 240
+        # Conditional blur based on resolution
+        if (width == 1920 and height == 1080) or (width == 1280 and height == 720):
+            # Scale factor for 720p (2/3 of 1080p values)
+            scale = 2/3 if width == 1280 else 1
+            
+            # Blur parameters (1080p base values, scaled for 720p)
+            left_blur_x = int(103 * scale)
+            left_blur_y = int(98 * scale)
+            left_blur_width = int(333 * scale)
+            left_blur_height = int(240 * scale)
 
-            bottom_blur_width = 293
-            bottom_blur_height = 28
-            bottom_blur_x = 764
-            bottom_blur_y = 1032
+            bottom_blur_width = int(293 * scale)
+            bottom_blur_height = int(28 * scale)
+            bottom_blur_x = int(764 * scale)
+            bottom_blur_y = int(1032 * scale)
 
-            voice_chat_width = 198
-            voice_chat_height = 502
-            voice_chat_x = 38
-            voice_chat_y = 357
+            voice_chat_width = int(198 * scale)
+            voice_chat_height = int(502 * scale)
+            voice_chat_x = int(38 * scale)
+            voice_chat_y = int(357 * scale)
 
-            text_chat_width = 425
-            text_chat_height = 168
-            text_chat_x = 25
-            text_chat_y = 695
+            text_chat_width = int(425 * scale)
+            text_chat_height = int(168 * scale)
+            text_chat_x = int(25 * scale)
+            text_chat_y = int(695 * scale)
 
-            replay_name_x = 730
-            replay_name_y = 1043
-            replay_name_width = 241
-            replay_name_height = 25
+            replay_name_x = int(730 * scale)
+            replay_name_y = int(1043 * scale)
+            replay_name_width = int(241 * scale)
+            replay_name_height = int(25 * scale)
 
             # Filter complex for blur
             filter_complex = (
                 f"[0:v]split=6[main][left_crop][bottom_crop][voice_crop][text_crop][replay_crop];"
-                f"[left_crop]crop={left_blur_width}:{left_blur_height}:{left_blur_x}:{left_blur_y},boxblur=lr=12:cr=6[left_blur];"
-                f"[bottom_crop]crop={bottom_blur_width}:{bottom_blur_height}:{bottom_blur_x}:{bottom_blur_y},boxblur=lr=12:cr=6[bottom_blur];"
-                f"[voice_crop]crop={voice_chat_width}:{voice_chat_height}:{voice_chat_x}:{voice_chat_y},boxblur=lr=12:cr=6[voice_blur];"
-                f"[text_crop]crop={text_chat_width}:{text_chat_height}:{text_chat_x}:{text_chat_y},boxblur=lr=12:cr=6[text_blur];"
-                f"[replay_crop]crop={replay_name_width}:{replay_name_height}:{replay_name_x}:{replay_name_y},boxblur=lr=12:cr=6[replay_blur];"
+                f"[left_crop]crop={left_blur_width}:{left_blur_height}:{left_blur_x}:{left_blur_y},boxblur=lr=8:cr=4[left_blur];"
+                f"[bottom_crop]crop={bottom_blur_width}:{bottom_blur_height}:{bottom_blur_x}:{bottom_blur_y},boxblur=lr=8:cr=4[bottom_blur];"
+                f"[voice_crop]crop={voice_chat_width}:{voice_chat_height}:{voice_chat_x}:{voice_chat_y},boxblur=lr=8:cr=4[voice_blur];"
+                f"[text_crop]crop={text_chat_width}:{text_chat_height}:{text_chat_x}:{text_chat_y},boxblur=lr=8:cr=4[text_blur];"
+                f"[replay_crop]crop={replay_name_width}:{replay_name_height}:{replay_name_x}:{replay_name_y},boxblur=lr=8:cr=4[replay_blur];"
                 f"[main][left_blur]overlay={left_blur_x}:{left_blur_y}[tmp1];"
                 f"[tmp1][bottom_blur]overlay={bottom_blur_x}:{bottom_blur_y}[tmp2];"
                 f"[tmp2][voice_blur]overlay={voice_chat_x}:{voice_chat_y}[tmp3];"
