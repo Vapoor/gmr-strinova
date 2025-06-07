@@ -1212,7 +1212,7 @@ async def blur_video(input_path: str, target_size_mb: int = 15) -> str:
             left_blur_x = int(103 * scale)
             left_blur_y = int(98 * scale)
             left_blur_width = int(333 * scale)
-            left_blur_height = int(240 * scale)
+            left_blur_height = int(310 * scale)
 
             bottom_blur_width = int(293 * scale)
             bottom_blur_height = int(28 * scale)
