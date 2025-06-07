@@ -206,6 +206,18 @@ class ChannelSetupModal(discord.ui.Modal):
         except Exception as e:
             await interaction.followup.send(f"❌ Setup failed: {str(e)}", ephemeral=True)
 
+
+
+
+class UnsupportedResolutionError(Exception):
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        super().__init__(f"Unsupported resolution: {width}x{height}")
+
+
+
+
 #####################################
 ####### RESULT SELECTOR #############
 #####################################
@@ -513,7 +525,22 @@ class RankSelector(discord.ui.View):
 
                 cleanup_files([self.video_path, blurred_video_path])
 
+
+        except UnsupportedResolutionError as e:
+            # Handle unsupported resolution error specifically
+            await remove_from_queue(self.user_id)
+            print(f"❌ [RESOLUTION] User {interaction.user.name} submitted unsupported resolution: {e.width}x{e.height}")
+            await interaction.followup.send(
+                content=f"❌ **Video resolution not supported: {e.width}x{e.height}**\n\n"
+                    f"**Supported resolutions only:**\n"
+                    f"• 1920x1080 (1080p)\n"
+                    f"• 1280x720 (720p)\n\n"
+                    f"Please convert your video to one of these resolutions and submit again.",
+                ephemeral=True
+            )
+            cleanup_files([self.video_path])
         except Exception as e:
+
             # Make sure to remove from queue on error
             await remove_from_queue(self.user_id)
             await interaction.followup.send(
@@ -1154,6 +1181,11 @@ async def blur_video(input_path: str, target_size_mb: int = 15) -> str:
         height = int(video_stream['height'])
         duration = float(probe_data['format']['duration'])
         
+        supported_resolutions = [(1920, 1080), (1280, 720)]
+        if (width, height) not in supported_resolutions:
+            print(f"❌ [RESOLUTION] Unsupported resolution: {width}x{height}")
+            print(f"    Supported resolutions: 1920x1080 (1080p), 1280x720 (720p)")
+            raise UnsupportedResolutionError(width, height)
         print(f"📐 [VIDEO_INFO] Resolution: {width}x{height}, Duration: {duration:.1f}s")
 
         # Force garbage collection before heavy processing
@@ -1751,8 +1783,9 @@ async def help_slash_command(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🎬 Supported video sources:",
-        value="• Direct file upload (up to 200MB)\n"
+        value="• Direct file upload (up to 150MB)\n"
               "• Catbox.moe links\n"
+              "• 1920x1080 or 1280x720 only\n"
               "• Formats: MP4, AVI, MOV, MKV, WMV, FLV, WEBM",
         inline=False
     )
