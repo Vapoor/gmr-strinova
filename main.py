@@ -11,6 +11,8 @@ import json
 import tempfile
 import io
 import time
+import gc
+import psutil
 from typing import List, Optional, Dict
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
@@ -26,10 +28,19 @@ ROLE_PING = '1379204201279782922' # ROTD ROLE ID
 CLIP_DATA_FILE = 'pending_clips.json'
 RESULTS_DATA_FILE = 'clip_results.json'
 video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
-MAX_CONCURRENT_PROCESSING = 3 # Max threads to not blow ffmpeg 
+MAX_CONCURRENT_PROCESSING = 1 # Max threads to not blow ffmpeg 
+MAX_FILE_SIZE_MB = 150
+TARGET_VIDEO_SIZE_MB = 15
 processing_semaphore = Semaphore(MAX_CONCURRENT_PROCESSING)
 processing_queue = [] # Tuple containing user_id / message of position
 CHANNEL_CONFIG_FILE = 'channel_config.json'
+
+def log_memory_usage(stage: str):
+    """Log current memory usage"""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024 / 1024
+    print(f"💾 [MEMORY] {stage}: {memory_mb:.1f}MB RSS, {process.memory_percent():.1f}% of system")
 
 RANKS = [
     {"name": "Singularity", "emoji": "<:Singularity:1379365129380036618>"},
@@ -685,8 +696,12 @@ class GuessRankSelector(discord.ui.View):
 #####################################################################################
 
 async def upload_to_catbox(file_path: str) -> str | None:
-    """Upload video to catbox.moe and return the URL"""
+    """Upload video to catbox.moe and return the URL with progress tracking"""
     try:
+        file_size = os.path.getsize(file_path) / (1024 * 1024)
+        print(f"📤 [CATBOX] Starting upload: {file_size:.1f}MB")
+        log_memory_usage("Upload start")
+        
         timeout = aiohttp.ClientTimeout(total=1800)  # 30 minutes for large files
         
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -695,17 +710,20 @@ async def upload_to_catbox(file_path: str) -> str | None:
                 data.add_field('reqtype', 'fileupload')
                 data.add_field('fileToUpload', f, filename='video.mp4', content_type='video/mp4')
                 
+                print(f"🌐 [CATBOX] Uploading to catbox.moe...")
                 async with session.post('https://catbox.moe/user/api.php', data=data) as response:
                     if response.status == 200:
                         url = await response.text()
                         if url.startswith('https://files.catbox.moe/'):
+                            print(f"✅ [CATBOX] Upload successful: {url.strip()}")
+                            log_memory_usage("Upload completed")
                             return url.strip()
                     
-                    print(f"Catbox upload failed: {response.status}")
+                    print(f"❌ [CATBOX] Upload failed with status: {response.status}")
                     return None
                     
     except Exception as e:
-        print(f"Error uploading to catbox: {e}")
+        print(f"❌ [CATBOX] Upload error: {e}")
         return None
 
 async def add_to_queue(user_id: int, interaction: discord.Interaction) -> int:
@@ -775,20 +793,32 @@ async def update_queue_position(user_id: int):
         if not user_found:
             break  # User no longer in queue, stop updating
 
-async def download_video_from_url(url: str, max_size_mb: int = 200) -> str | None:
+async def download_video_from_url(url: str, max_size_mb: int = 150) -> str | None:
     try:
+        print(f"⬇️ [DOWNLOAD] Starting download from: {url}")
+        log_memory_usage("Download start")
+        
         timeout = aiohttp.ClientTimeout(total=600) #10min timeout
         headers = {"User-Agent": "Mozilla/5.0"}
 
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             async with session.get(url) as response:
                 if response.status != 200:
-                    print(f"HTTP error: {response.status}")
+                    print(f"❌ [DOWNLOAD] HTTP error: {response.status}")
                     return None
 
                 content_type = response.headers.get("Content-Type", "")
+                content_length = response.headers.get("Content-Length")
+                
+                if content_length:
+                    size_mb = int(content_length) / (1024 * 1024)
+                    print(f"📏 [DOWNLOAD] File size: {size_mb:.1f}MB")
+                    if size_mb > max_size_mb:
+                        print(f"❌ [DOWNLOAD] File too large: {size_mb:.1f}MB > {max_size_mb}MB")
+                        return None
+                
                 if "video" not in content_type and not url.lower().endswith(tuple(video_extensions)):
-                    print(f"Invalid content-type: {content_type}")
+                    print(f"❌ [DOWNLOAD] Invalid content-type: {content_type}")
                     return None
 
                 suffix = os.path.splitext(url.split("?")[0])[1]
@@ -797,22 +827,34 @@ async def download_video_from_url(url: str, max_size_mb: int = 200) -> str | Non
 
                 max_bytes = max_size_mb * 1024 * 1024
                 total_downloaded = 0
+                chunk_count = 0
 
+                print(f"📦 [DOWNLOAD] Downloading in chunks...")
                 with open(temp_path, "wb") as f:
-                    async for chunk in response.content.iter_chunked(64 * 1024):  # 64KB chunks
+                    async for chunk in response.content.iter_chunked(32 * 1024):  # Smaller chunks for VPS
                         total_downloaded += len(chunk)
+                        chunk_count += 1
+                        
                         if total_downloaded > max_bytes:
-                            print("File too large, aborting")
+                            print(f"❌ [DOWNLOAD] File too large during download, aborting")
                             os.remove(temp_path)
                             return None
                         f.write(chunk)
+                        
+                        # Log progress every 100 chunks (3.2MB)
+                        if chunk_count % 100 == 0:
+                            mb_downloaded = total_downloaded / (1024 * 1024)
+                            print(f"    📦 Downloaded: {mb_downloaded:.1f}MB")
 
+                final_size = total_downloaded / (1024 * 1024)
+                print(f"✅ [DOWNLOAD] Download completed: {final_size:.1f}MB")
+                log_memory_usage("Download completed")
                 return temp_path
+                
     except Exception as e:
-        print(f"Download error: {e}")
+        print(f"❌ [DOWNLOAD] Error: {e}")
         traceback.print_exc()
         return None
-
 def load_channel_config() -> Dict:
     """Load channel configuration from JSON file"""
     if os.path.exists(CHANNEL_CONFIG_FILE):
@@ -1077,14 +1119,16 @@ import tempfile
 import asyncio
 import subprocess
 
-async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
-    """Apply adaptive blur and compress video using FFmpeg."""
+async def blur_video(input_path: str, target_size_mb: int = 15) -> str:
+    """Apply adaptive blur and compress video using FFmpeg with memory optimization."""
+    log_memory_usage("Video processing start")
+    
     # Create temporary output file
     output_fd, output_path = tempfile.mkstemp(suffix='.mp4')
     os.close(output_fd)
 
-    # FFprobe to get video info
     try:
+        # FFprobe to get video info
         probe_cmd = [
             'ffprobe', '-v', 'quiet', '-print_format', 'json',
             '-show_format', '-show_streams', input_path
@@ -1099,6 +1143,7 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
             raise Exception(f"FFprobe failed: {stderr.decode()}")
 
         probe_data = json.loads(stdout.decode())
+        print(f"🔍 [FFPROBE] Video analysis completed")
 
         # Extract resolution and duration
         video_stream = next((s for s in probe_data['streams'] if s['codec_type'] == 'video'), None)
@@ -1108,18 +1153,28 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
         width = int(video_stream['width'])
         height = int(video_stream['height'])
         duration = float(probe_data['format']['duration'])
+        
+        print(f"📐 [VIDEO_INFO] Resolution: {width}x{height}, Duration: {duration:.1f}s")
 
-        # Compute bitrate
+        # Force garbage collection before heavy processing
+        gc.collect()
+        log_memory_usage("Before FFmpeg processing")
+
+        # Compute bitrate with lower target for VPS
         target_bitrate_kbps = int((target_size_mb * 8192) / duration)
-        target_bitrate_kbps = max(500, min(target_bitrate_kbps, 5000))
+        target_bitrate_kbps = max(400, min(target_bitrate_kbps, 4000))  # Reduced max bitrate
+        
+        print(f"🎯 [ENCODING] Target bitrate: {target_bitrate_kbps}kbps")
 
-        # Build base FFmpeg command
+        # Build base FFmpeg command with memory-optimized settings
         ffmpeg_cmd = ['ffmpeg', '-y', '-i', input_path]
 
         # Conditional blur based on resolution
         if (width == 1920 and height == 1080) or (width == 1280 and height == 720):
             # Scale factor for 720p (2/3 of 1080p values)
             scale = 2/3 if width == 1280 else 1
+            
+            print(f"🎨 [BLUR] Applying blur with scale factor: {scale}")
             
             # Blur parameters (1080p base values, scaled for 720p)
             left_blur_x = int(103 * scale)
@@ -1164,22 +1219,26 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
 
             ffmpeg_cmd += ['-filter_complex', filter_complex, '-map', '[vout]']
         else:
+            print(f"🎨 [BLUR] No blur applied - unsupported resolution")
             ffmpeg_cmd += ['-map', '0:v']
 
-        # Final encoding settings
+        # VPS-optimized encoding settings
         ffmpeg_cmd += [
             '-c:v', 'libx264',
-            '-preset', 'medium',
-            '-crf', '22',
+            '-preset', 'fast',  # Changed from 'medium' to 'fast' for VPS
+            '-crf', '24',       # Slightly higher CRF for faster encoding
             '-maxrate', f'{target_bitrate_kbps}k',
-            '-bufsize', f'{2 * target_bitrate_kbps}k',
+            '-bufsize', f'{target_bitrate_kbps}k',  # Reduced buffer size
             '-c:a', 'aac',
-            '-b:a', '128k',
+            '-b:a', '96k',      # Reduced audio bitrate
             '-pix_fmt', 'yuv420p',
             '-movflags', '+faststart',
+            '-threads', '1',    # Limit to 1 thread for 1 vCore
             output_path
         ]
 
+        print(f"🚀 [FFMPEG] Starting encoding process...")
+        
         # Execute FFmpeg
         proc = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
@@ -1187,20 +1246,36 @@ async def blur_video(input_path: str, target_size_mb: int = 20) -> str:
             stderr=asyncio.subprocess.PIPE
         )
         _, stderr = await proc.communicate()
+        
         if proc.returncode != 0:
+            print(f"❌ [FFMPEG] Encoding failed: {stderr.decode()}")
             raise Exception(f"FFmpeg failed: {stderr.decode()}")
 
-        print(f"Output video size: {os.path.getsize(output_path) / (1024 * 1024):.2f} MB")
+        final_size = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"✅ [FFMPEG] Encoding completed. Output size: {final_size:.2f}MB")
+        
+        # Force garbage collection after processing
+        gc.collect()
+        log_memory_usage("After FFmpeg processing")
+        
         return output_path
 
     except Exception as e:
         if os.path.exists(output_path):
             os.remove(output_path)
+        print(f"❌ [VIDEO_PROCESSING] Error: {e}")
         raise e
 
 @bot.event
 async def on_ready():
     print(f'{bot.user} is connected and ready!')
+    log_memory_usage("Bot startup")
+    
+    # System information
+    cpu_count = psutil.cpu_count()
+    memory = psutil.virtual_memory()
+    print(f"💻 [SYSTEM] CPU cores: {cpu_count}, RAM: {memory.total / (1024**3):.1f}GB")
+    print(f"📊 [SYSTEM] Available RAM: {memory.available / (1024**2):.0f}MB")
     await tree.sync()
     print(f'Servers: {len(bot.guilds)}')
     
