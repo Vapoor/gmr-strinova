@@ -414,7 +414,7 @@ class RankSelector(discord.ui.View):
                 try:
                     blurred_video_path = await asyncio.wait_for(
                         blur_video(self.video_path),
-                        timeout=600
+                        timeout=1200 #10min max for bluring / compress
                     )
                 except TimeoutError:
                     await interaction.followup.send(
@@ -729,7 +729,7 @@ async def upload_to_catbox(file_path: str) -> str | None:
         print(f"📤 [CATBOX] Starting upload: {file_size:.1f}MB")
         log_memory_usage("Upload start")
         
-        timeout = aiohttp.ClientTimeout(total=1800)  # 30 minutes for large files
+        timeout = aiohttp.ClientTimeout(total=1200)  # 20 minutes for large files
         
         async with aiohttp.ClientSession(timeout=timeout) as session:
             with open(file_path, 'rb') as f:
