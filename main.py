@@ -43,15 +43,15 @@ def log_memory_usage(stage: str):
     print(f"💾 [MEMORY] {stage}: {memory_mb:.1f}MB RSS, {process.memory_percent():.1f}% of system")
 
 RANKS = [
-    {"name": "Singularity", "emoji": "<:Singularity:1379365129380036618>"},
-    {"name": "Superstring", "emoji": "<:Superstring:1379365132592873482>"},
-    {"name": "Quark", "emoji": "<:Masters:1379365124309254146>"},
-    {"name": "Electron", "emoji": "<:Electron:1379365122988048485>"},
-    {"name": "Neutron", "emoji": "<:Neutron:1379365126842351706>"},
-    {"name": "Proton", "emoji": "<:Proton:1379365128213893140>"},
-    {"name": "Atom", "emoji": "<:Atom:1379365121176109108>"},
-    {"name": "Molecule", "emoji": "<:Molecule:1379365125408034918>"},
-    {"name": "Substance", "emoji": "<:Substance:1379365131129192488>"}
+    {"name": "Singularity", "emoji": "<:Singularity:1320747980361433128>"},
+    {"name": "Superstring", "emoji": "<:Superstring:1320747969192005714>"},
+    {"name": "Quark", "emoji": "<:Masters:1320747900430454857>"},
+    {"name": "Electron", "emoji": "<:Electron:1320747887600074846>"},
+    {"name": "Neutron", "emoji": "<:Neutron:1320747871376638013>"},
+    {"name": "Proton", "emoji": "<:Proton:1320747859267555489>"},
+    {"name": "Atom", "emoji": "<:Atom:1320747847062388736>"},
+    {"name": "Molecule", "emoji": "<:Molecule:1320747835301429350>"},
+    {"name": "Substance", "emoji": "<:Substance:1320747815625818202>"}
 ]
 
 RANK_EMOJIS = {rank["name"]: rank["emoji"] for rank in RANKS}
