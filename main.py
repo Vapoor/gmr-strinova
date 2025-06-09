@@ -515,11 +515,11 @@ class RankSelector(discord.ui.View):
 
 class GuessRankSelector(discord.ui.View):
     def __init__(self, clip_id: str, correct_rank: str):
-        super().__init__(timeout=None)  # 24 hours timeout
+        super().__init__(timeout=None)  # No timeout for persistent views
         self.clip_id = clip_id
         self.correct_rank = correct_rank
         
-        # Create rank options using the RANK_EMOJIS dictionary
+        # Create rank options using the RANKS list
         rank_options = []
         for rank in RANKS:
             rank_options.append(
@@ -531,7 +531,7 @@ class GuessRankSelector(discord.ui.View):
             min_values=1,
             max_values=1,
             options=rank_options,
-            custom_id=f"rank_select_{clip_id}"
+            custom_id=f"rank_select_{clip_id}"  # Add custom_id for persistence
         )
         self.rank_select.callback = self.guess_callback
         self.add_item(self.rank_select)
@@ -556,12 +556,26 @@ class GuessRankSelector(discord.ui.View):
             await interaction.response.send_message("❌ Voting period has ended for this clip!", ephemeral=True)
             return
         
-        # Check if user already voted
-        user_votes = clip_data.get('user_votes', {})
-        previous_vote = user_votes.get(str(user_id))
+        # Initialize user vote tracking
+        if 'user_votes' not in clip_data:
+            clip_data['user_votes'] = {}
+        if 'user_vote_count' not in clip_data:
+            clip_data['user_vote_count'] = {}
+        
+        user_vote_count = clip_data['user_vote_count'].get(str(user_id), 0)
+        previous_vote = clip_data['user_votes'].get(str(user_id))
+        
+        # Check vote limit (1 original + 1 change = 2 total)
+        if user_vote_count >= 2:
+            await interaction.response.send_message("❌ You've reached the vote limit! (1 original vote + 1 change allowed)", ephemeral=True)
+            return
         
         if previous_vote:
             # User is changing their vote
+            if previous_vote == selected_rank:
+                await interaction.response.send_message("❌ You've already voted for this rank!", ephemeral=True)
+                return
+                
             # Remove previous vote from rank count
             if previous_vote in clip_data['votes']:
                 clip_data['votes'][previous_vote] = max(0, clip_data['votes'][previous_vote] - 1)
@@ -571,13 +585,17 @@ class GuessRankSelector(discord.ui.View):
             # Update correct votes count if needed
             if previous_vote == clip_data['correct_rank']:
                 clip_data['correct_votes'] = max(0, clip_data['correct_votes'] - 1)
+                
+            # Increment vote count for this user
+            clip_data['user_vote_count'][str(user_id)] = user_vote_count + 1
+            vote_text = f"changed your vote to **{selected_rank}**! (Vote changes remaining: 0)"
         else:
             # New vote
             clip_data['total_votes'] += 1
+            clip_data['user_vote_count'][str(user_id)] = 1
+            vote_text = f"voted **{selected_rank}**! (You can change your vote 1 more time)"
         
         # Add new vote
-        if 'user_votes' not in clip_data:
-            clip_data['user_votes'] = {}
         clip_data['user_votes'][str(user_id)] = selected_rank
         
         # Update rank vote count
@@ -596,12 +614,11 @@ class GuessRankSelector(discord.ui.View):
         save_results_data(results_data)
         
         # Send confirmation to user
-        vote_text = f"changed your vote to **{selected_rank}**" if previous_vote else f"voted **{selected_rank}**"
         await interaction.response.send_message(
-            f"✅ You {vote_text}! Results will be revealed when voting ends.",
+            f"✅ You {vote_text} Results will be revealed when voting ends.",
             ephemeral=True
         )
-    
+
     async def disable_view_in_message(self, guild_id: int):
         """Disable the view when the voting period expires"""
         try:
@@ -626,8 +643,14 @@ class GuessRankSelector(discord.ui.View):
                                 
                                 # Update the message with disabled view
                                 await message.edit(view=self)
+                                
+                                # Schedule message deletion after a short delay to allow users to see final state
+                                await asyncio.sleep(10)  # Wait 10 seconds
+                                await message.delete()
+                                print(f"Deleted guess message for clip {self.clip_id} in guild {guild_id}")
+                                
                             except discord.NotFound:
-                                pass  # Message was deleted
+                                pass  # Message was already deleted
                             except Exception as e:
                                 print(f"Error disabling view: {e}")
         except Exception as e:
@@ -1305,7 +1328,7 @@ async def on_raw_reaction_add(payload):
                 embed.add_field(name="⏰ Voting Time", value="24 hours", inline=True)
                 embed.set_footer(text="Select your guess from the dropdown below!")
                 
-                guess_message = await guess_channel.send(embed=embed)
+                guess_message = await guess_channel.send(content=f"<@&{ROLE_PING}>",embed=embed)
             else:
                 # Discord attachment - check if message has attachments
                 if message.attachments:
@@ -1652,8 +1675,6 @@ async def help_slash_command(interaction: discord.Interaction):
         name="🎬 Supported video sources:",
         value="• Direct file upload (up to 200MB)\n"
               "• Catbox.moe links\n"
-              "• Discord CDN links\n"
-              "• Any direct video URL\n"
               "• Formats: MP4, AVI, MOV, MKV, WMV, FLV, WEBM",
         inline=False
     )
@@ -1661,7 +1682,7 @@ async def help_slash_command(interaction: discord.Interaction):
         name="🛠️ Commands:",
         value="`/setup` - Configure channels (Admin)\n"
               "`/help` - Show this help\n"
-              "`/results` - Browse results from past clips\n"
+              "`/results` - Browse results from past clips (last 25)\n"
               "`/cleanup` - Cleanup expired clips (Admin)",
         inline=False
     )
