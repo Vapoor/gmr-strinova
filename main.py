@@ -227,6 +227,8 @@ class ResultsSelector(discord.ui.View):
         super().__init__(timeout=60)
         self.guild_id = guild_id
         
+        print(f"📊 [RESULTS] Loading results selector for guild {guild_id}")
+        
         # Take all the clips that are dones
         results_data = load_results_data()
         finished_clips = []
@@ -246,6 +248,10 @@ class ResultsSelector(discord.ui.View):
                         'emoji': rank_emoji,
                         'votes': clip_data.get('total_votes', 0)
                     })
+            
+            print(f"    Found {len(finished_clips)} finished clips")
+        else:
+            print(f"    No clips data found for guild {guild_id}")
         
         # Sort by date (newest first)
         finished_clips.sort(key=lambda x: x['date'], reverse=True)
@@ -259,9 +265,11 @@ class ResultsSelector(discord.ui.View):
                 options=[discord.SelectOption(label="No clips", value="none", description="No finished clips found")]
             )
             self.clip_select.disabled = True
+            print(f"    No finished clips available for selection")
         else:
             # Limit is 25 (discord)
             finished_clips = finished_clips[:25]
+            print(f"    Created selector with {len(finished_clips)} clips")
             
             self.clip_select = discord.ui.Select(
                 placeholder="Select a clip to view results...",
@@ -286,12 +294,17 @@ class ResultsSelector(discord.ui.View):
             return
         
         clip_id = self.clip_select.values[0]
-        results_embed = get_results_embed(clip_id, self.guild_id)
+        print(f"📊 [RESULTS] User {interaction.user.name} selected clip {clip_id}")
+        
+        # Use updated function signature
+        results_embed, ping_content, video_url = get_results_embed(clip_id, self.guild_id)
         
         if results_embed:
             results_embed.set_footer(text=f"Clip ID: {clip_id}")
             await interaction.response.send_message(embed=results_embed, ephemeral=True)
+            print(f"    ✅ Results displayed successfully")
         else:
+            print(f"    ❌ Failed to load results for clip {clip_id}")
             await interaction.response.send_message("❌ Error loading results for this clip.", ephemeral=True)
             
             
@@ -1012,26 +1025,52 @@ def save_vote(clip_id: str, guessed_rank: str, user_id: int):
     save_results_data(results_data)
     return True
 
-def get_results_embed(clip_id: str, guild_id: int) -> discord.Embed:
+def get_results_embed(clip_id: str, guild_id: int) -> tuple[discord.Embed, str, str]:
     """Generate results embed with percentages for a specific server"""
     results_data = load_results_data()
     
     # Check if server and clip exist
     if guild_id not in results_data or clip_id not in results_data[guild_id]:
-        return None
+        print(f"📊 [RESULTS] No data found for clip {clip_id} in guild {guild_id}")
+        return None, None, None
     
     clip_data = results_data[guild_id][clip_id]
     correct_rank = clip_data.get('correct_rank', 'Unknown')
     total_votes = clip_data.get('total_votes', 0)
+    video_url = clip_data.get('video_url', None)
+    submitter_id = clip_data.get('submitter_id', None)
     
+    print(f"📊 [RESULTS] Generating results for clip {clip_id}")
+    print(f"    🏆 Correct rank: {correct_rank}")
+    print(f"    🗳️ Total votes: {total_votes}")
+    print(f"    🎬 Video URL: {video_url}")
+    print(f"    👤 Submitter ID: {submitter_id}")
+    
+    # Calculate correct guess percentage
+    votes_data = clip_data.get('votes', {})
+    correct_votes = votes_data.get(correct_rank, 0)
+    correct_percentage = (correct_votes / total_votes * 100) if total_votes > 0 else 0
+    
+    # Create the main message content
+    main_content = f"🎯 **Result Guess The Rank**\n"
+    if submitter_id:
+        main_content += f"Clip sent by: <@{submitter_id}>\n"
+    main_content += f"Correct Rank guess: **{correct_percentage:.1f}%** ({correct_votes}/{total_votes} votes)\n"
+    
+    # Create the embed for detailed results
     embed = discord.Embed(
-        title="🎯 Results - Guess The Rank",
-        description=f"**Correct Rank:** {correct_rank}\n**Total Votes:** {total_votes}",
+        title="📊 Detailed Vote Distribution",
+        description=f"**Correct Rank:** {correct_rank} • **Total Votes:** {total_votes}",
         color=0x7AB0E7
     )
     
-    # Calculate percentages from vote data
-    votes_data = clip_data.get('votes', {})
+    # Add video if available
+    if video_url:
+        embed.add_field(name="🎬 Original Video", value=f"[Watch Video]({video_url})", inline=False)
+        # Set the video as the image in the embed for preview
+        embed.set_image(url=video_url)
+    
+    # Calculate percentages from vote data and create detailed breakdown
     results_text = ""
     
     for rank in RANKS:
@@ -1045,9 +1084,11 @@ def get_results_embed(clip_id: str, guild_id: int) -> discord.Embed:
         else:
             results_text += f"{emoji} {rank_name}: {votes_count} votes ({percentage:.1f}%)\n"
     
-    embed.add_field(name="📊 Vote Distribution", value=results_text, inline=False)
+    embed.add_field(name="🗳️ All Votes", value=results_text, inline=False)
     
-    return embed
+    print(f"📊 [RESULTS] Results embed generated successfully")
+    print(f"    ✅ Correct guess rate: {correct_percentage:.1f}%")
+    return embed, main_content, video_url
 
 async def register_persistent_views():
     """Register persistent views for all active clips across all servers"""
@@ -1089,6 +1130,8 @@ async def check_expired_clips():
             end_time = datetime.fromisoformat(clip_data['end_time'])
             
             if current_time > end_time:
+                print(f"⏰ [EXPIRED] Clip {clip_id} in guild {guild_id} has expired")
+                
                 # Mark as expired
                 clip_data['expired'] = True
                 
@@ -1097,8 +1140,9 @@ async def check_expired_clips():
                     # Create a temporary view instance to disable it
                     temp_view = GuessRankSelector(clip_id, clip_data.get('correct_rank', 'Unknown'))
                     await temp_view.disable_view_in_message(guild_id)
+                    print(f"    ✅ Disabled voting view for clip {clip_id}")
                 except Exception as e:
-                    print(f"Error disabling view for clip {clip_id}: {e}")
+                    print(f"    ❌ Error disabling view for clip {clip_id}: {e}")
                 
                 # Find the results channel for this specific server
                 guild = bot.get_guild(guild_id)
@@ -1107,12 +1151,26 @@ async def check_expired_clips():
                     results_channel = discord.utils.get(guild.channels, name=results_channel_name)
                     
                     if results_channel:
-                        results_embed = get_results_embed(clip_id, guild_id)
+                        # Get results with video and ping
+                        results_embed, ping_content, video_url = get_results_embed(clip_id, guild_id)
+                        
                         if results_embed:
                             try:
-                                await results_channel.send(embed=results_embed)
+                                # Send the results message with the new format
+                                await results_channel.send(
+                                    content=ping_content,  # This now contains the full formatted message
+                                    embed=results_embed
+                                )
+                                print(f"    ✅ Posted results for clip {clip_id} to {results_channel.name}")
+                                
                             except Exception as e:
-                                print(f"Error posting results to {guild.name}: {e}")
+                                print(f"    ❌ Error posting results to {guild.name}: {e}")
+                        else:
+                            print(f"    ❌ Failed to generate results embed for clip {clip_id}")
+                    else:
+                        print(f"    ❌ Results channel '{results_channel_name}' not found in guild {guild.name}")
+                else:
+                    print(f"    ❌ Guild {guild_id} not found")
     
     save_results_data(results_data)
 
