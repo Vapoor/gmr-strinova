@@ -16,15 +16,15 @@ pip install -r requirements.txt
 - **/setup** (Admin only)
 - **/results**
 - **/help**
-- **/cleanup**
+- **/cleanup** (Admin only)
 
 ## What he can do :
-- Receiving a clip until **200MB**, using either default discord embed files, or catbox website
-- If the video is detected 1920x1080, the blur is automatic on all the voice chat / banner / replay names etc
+- Receiving a clip under **150MB**, using either default discord embed files, or catbox website.
+- The video can only be received in 1920x1080 or 1280x720.
 - After getting compressed using FFMPEG (3 threads max aka 3 rendering clip at the same time maximum to avoid burning GPU / RAM), the clip goes to the channel that got setup by the mods.
-- The clip can either be accepted or rejected, if rejected, its deleted from the channel, if accepted, its deleted and moved to guess-the-rank channel, where you can see the clip, people have 24h to lock their guesses, after locking 1 guess, the guess is locked forever, the user instantly have the rank after the 1st guess.
-- 24h Later, a small chart with percent is droped, showing how the rank distribution went.
-- user can cleanup the oldest clip (only for PC performance, doesnt affect anything for user UI because of 25 dropdown limit)
+- The clip can either be accepted or rejected, if rejected, its deleted from the channel, if accepted, its deleted and moved to guess-the-rank channel, where you can see the clip, people have 24h to lock their guesses, after locking 1 guess, the guess is locked forever.
+- 24h Later, a small chart with percent is droped, showing how the rank distribution went who send the clip and the rate of sucesss.
+- Admin can cleanup the oldest clip (only for PC performance, doesnt affect anything for user UI because of 25 dropdown limit)
 
 ## Known Issues
 - **ALL THE CODE** is in the same file
