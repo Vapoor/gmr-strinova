@@ -294,20 +294,28 @@ class ResultsSelector(discord.ui.View):
         clip_id = self.clip_select.values[0]
         print(f"📊 [RESULTS] User {interaction.user.name} selected clip {clip_id}")
         
-        # Use detailed function for public viewing
-        results_embed, message_content, video_url = await get_results_embed_with_users(clip_id, self.guild_id, bot)
+        # Defer the response immediately to prevent timeout
+        await interaction.response.defer(ephemeral=False)
         
-        if results_embed:
-            results_embed.set_footer(text=f"Clip ID: {clip_id}")
-            # Send as public message (not ephemeral)
-            await interaction.response.send_message(
-                content=message_content,
-                embed=results_embed,
-                ephemeral=False  # Public message
-            )
-            print(f"    ✅ Public results displayed successfully")
-        else:
-            await interaction.response.send_message("❌ Error loading results for this clip.", ephemeral=True)
+        try:
+            # Use detailed function for public viewing
+            results_embed, message_content, video_url = await get_results_embed_with_users(clip_id, self.guild_id, bot)
+            
+            if results_embed:
+                results_embed.set_footer(text=f"Clip ID: {clip_id}")
+                # Use followup since we deferred the response
+                await interaction.followup.send(
+                    content=message_content,
+                    embed=results_embed,
+                    ephemeral=False  # Public message
+                )
+                print(f"    ✅ Public results displayed successfully")
+            else:
+                await interaction.followup.send("❌ Error loading results for this clip.", ephemeral=True)
+                
+        except Exception as e:
+            print(f"    ❌ Error in select_callback: {e}")
+            await interaction.followup.send("❌ An error occurred while loading results.", ephemeral=True)
             
             
 ######################################
@@ -877,11 +885,15 @@ async def get_results_embed_with_users(clip_id: str, guild_id: int, bot_instance
         try:
             user = bot_instance.get_user(int(submitter_id))
             if not user:
-                user = await bot_instance.fetch_user(int(submitter_id))
+                # Use asyncio.wait_for to timeout the fetch if it takes too long
+                user = await asyncio.wait_for(bot_instance.fetch_user(int(submitter_id)), timeout=2.0)
             if user:
                 submitter_name = user.display_name
-        except:
-            pass
+        except (asyncio.TimeoutError, discord.NotFound, ValueError):
+            submitter_name = f"User-{str(submitter_id)[-4:]}"
+        except Exception as e:
+            print(f"    ⚠️ Error fetching submitter {submitter_id}: {e}")
+            submitter_name = f"User-{str(submitter_id)[-4:]}"
     
     # Create the main message content
     main_content = f"🎯 **Result**\n"
@@ -903,17 +915,43 @@ async def get_results_embed_with_users(clip_id: str, guild_id: int, bot_instance
     
     # Group users by their votes and show individual guesses
     rank_users = {}
+
+    # Collect all user IDs first
+    user_ids_to_fetch = []
+    for user_id_str in user_votes.keys():
+        try:
+            user_id = int(user_id_str)
+            if not bot_instance.get_user(user_id):  # Only fetch if not in cache
+                user_ids_to_fetch.append(user_id)
+        except ValueError:
+            continue
+
+    # Batch fetch users (with timeout protection)
+    fetched_users = {}
+    if user_ids_to_fetch:
+        print(f"    📥 Fetching {len(user_ids_to_fetch)} users not in cache...")
+        for user_id in user_ids_to_fetch[:10]:  # Limit to 10 fetches to prevent long delays
+            try:
+                user = await asyncio.wait_for(bot_instance.fetch_user(user_id), timeout=1.0)
+                if user:
+                    fetched_users[user_id] = user
+            except (asyncio.TimeoutError, discord.NotFound):
+                continue
+            except Exception as e:
+                print(f"    ⚠️ Error fetching user {user_id}: {e}")
+                continue
+
+    # Now process votes with cached + fetched users
     for user_id_str, voted_rank in user_votes.items():
         if voted_rank not in rank_users:
             rank_users[voted_rank] = []
         
-        # Get username
+        # Get username efficiently
         try:
-            user = bot_instance.get_user(int(user_id_str))
-            if not user:
-                user = await bot_instance.fetch_user(int(user_id_str))
+            user_id = int(user_id_str)
+            user = bot_instance.get_user(user_id) or fetched_users.get(user_id)
             username = user.display_name if user else f"User-{user_id_str[-4:]}"
-        except:
+        except (ValueError, AttributeError):
             username = f"User-{user_id_str[-4:]}"
         
         rank_users[voted_rank].append(username)
