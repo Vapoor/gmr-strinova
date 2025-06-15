@@ -30,7 +30,7 @@ RESULTS_DATA_FILE = 'clip_results.json'
 video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
 MAX_CONCURRENT_PROCESSING = 1 # Max threads to not blow ffmpeg 
 MAX_FILE_SIZE_MB = 150
-TARGET_VIDEO_SIZE_MB = 15
+TARGET_VIDEO_SIZE_MB = 25
 processing_semaphore = Semaphore(MAX_CONCURRENT_PROCESSING)
 processing_queue = [] # Tuple containing user_id / message of position
 CHANNEL_CONFIG_FILE = 'channel_config.json'
@@ -55,6 +55,10 @@ RANKS = [
 ]
 
 RANK_EMOJIS = {rank["name"]: rank["emoji"] for rank in RANKS}
+RANK_ORDER = {rank["name"]: i for i, rank in enumerate(RANKS)}
+POINTS_EXACT = 10
+POINTS_PER_RANK_OFF = -2
+STREAK_MULTIPLIER_BASE = 0.10
 
 # Bot configuration
 intents = discord.Intents.default()
@@ -229,7 +233,6 @@ class ResultsSelector(discord.ui.View):
         
         print(f"📊 [RESULTS] Loading results selector for guild {guild_id}")
         
-        # Take all the clips that are dones
         results_data = load_results_data()
         finished_clips = []
         
@@ -253,11 +256,9 @@ class ResultsSelector(discord.ui.View):
         else:
             print(f"    No clips data found for guild {guild_id}")
         
-        # Sort by date (newest first)
         finished_clips.sort(key=lambda x: x['date'], reverse=True)
         
         if not finished_clips:
-            # No clip ended
             self.clip_select = discord.ui.Select(
                 placeholder="No finished clips available",
                 min_values=1,
@@ -265,11 +266,8 @@ class ResultsSelector(discord.ui.View):
                 options=[discord.SelectOption(label="No clips", value="none", description="No finished clips found")]
             )
             self.clip_select.disabled = True
-            print(f"    No finished clips available for selection")
         else:
-            # Limit is 25 (discord)
             finished_clips = finished_clips[:25]
-            print(f"    Created selector with {len(finished_clips)} clips")
             
             self.clip_select = discord.ui.Select(
                 placeholder="Select a clip to view results...",
@@ -296,15 +294,19 @@ class ResultsSelector(discord.ui.View):
         clip_id = self.clip_select.values[0]
         print(f"📊 [RESULTS] User {interaction.user.name} selected clip {clip_id}")
         
-        # Use updated function signature
-        results_embed, ping_content, video_url = get_results_embed(clip_id, self.guild_id)
+        # Use detailed function for public viewing
+        results_embed, message_content, video_url = await get_results_embed_with_users(clip_id, self.guild_id, bot)
         
         if results_embed:
             results_embed.set_footer(text=f"Clip ID: {clip_id}")
-            await interaction.response.send_message(embed=results_embed, ephemeral=True)
-            print(f"    ✅ Results displayed successfully")
+            # Send as public message (not ephemeral)
+            await interaction.response.send_message(
+                content=message_content,
+                embed=results_embed,
+                ephemeral=False  # Public message
+            )
+            print(f"    ✅ Public results displayed successfully")
         else:
-            print(f"    ❌ Failed to load results for clip {clip_id}")
             await interaction.response.send_message("❌ Error loading results for this clip.", ephemeral=True)
             
             
@@ -419,15 +421,18 @@ class RankSelector(discord.ui.View):
                 await remove_from_queue(self.user_id)
                 
                 await interaction.followup.send(
-                    content=f"🔄 Now processing your video... ({original_size_mb:.1f}MB)\nThis may take a few minutes.",
+                    content=f"🔄 **Processing your video with enhanced quality...**\n"
+                        f"📦 Input: {original_size_mb:.1f}MB\n"
+                        f"🎯 Target: ~{TARGET_VIDEO_SIZE_MB}MB with improved bitrate\n"
+                        f"⏱️ This may take a few minutes for quality processing.",
                     ephemeral=True
                 )
 
-                # Process the video with blur
+                # Process the video with blur and enhanced quality
                 try:
                     blurred_video_path = await asyncio.wait_for(
                         blur_video(self.video_path),
-                        timeout=1200 #10min max for bluring / compress
+                        timeout=1800  # Increased to 30min for better quality processing
                     )
                 except TimeoutError:
                     await interaction.followup.send(
@@ -566,11 +571,10 @@ class RankSelector(discord.ui.View):
 
 class GuessRankSelector(discord.ui.View):
     def __init__(self, clip_id: str, correct_rank: str):
-        super().__init__(timeout=None)  # No timeout for persistent views
+        super().__init__(timeout=None)
         self.clip_id = clip_id
         self.correct_rank = correct_rank
         
-        # Create rank options using the RANKS list
         rank_options = []
         for rank in RANKS:
             rank_options.append(
@@ -582,7 +586,7 @@ class GuessRankSelector(discord.ui.View):
             min_values=1,
             max_values=1,
             options=rank_options,
-            custom_id=f"rank_select_{clip_id}"  # Add custom_id for persistence
+            custom_id=f"rank_select_{clip_id}"
         )
         self.rank_select.callback = self.guess_callback
         self.add_item(self.rank_select)
@@ -592,7 +596,6 @@ class GuessRankSelector(discord.ui.View):
         user_id = interaction.user.id
         guild_id = interaction.guild.id
         
-        # Check server-specific voting data
         results_data = load_results_data()
         
         if guild_id not in results_data or self.clip_id not in results_data[guild_id]:
@@ -622,7 +625,6 @@ class GuessRankSelector(discord.ui.View):
             return
         
         if previous_vote:
-            # User is changing their vote
             if previous_vote == selected_rank:
                 await interaction.response.send_message("❌ You've already voted for this rank!", ephemeral=True)
                 return
@@ -637,11 +639,9 @@ class GuessRankSelector(discord.ui.View):
             if previous_vote == clip_data['correct_rank']:
                 clip_data['correct_votes'] = max(0, clip_data['correct_votes'] - 1)
                 
-            # Increment vote count for this user
             clip_data['user_vote_count'][str(user_id)] = user_vote_count + 1
             vote_text = f"changed your vote to **{selected_rank}**! (Vote changes remaining: 0)"
         else:
-            # New vote
             clip_data['total_votes'] += 1
             clip_data['user_vote_count'][str(user_id)] = 1
             vote_text = f"voted **{selected_rank}**! (You can change your vote 1 more time)"
@@ -734,6 +734,217 @@ class GuessRankSelector(discord.ui.View):
 #####################################################################################
 #################################### UTILS ##########################################
 #####################################################################################
+
+def calculate_score(guessed_rank: str, correct_rank: str, streak: int = 0) -> tuple[int, bool]:
+    """Calculate score based on guess accuracy and streak"""
+    if guessed_rank not in RANK_ORDER or correct_rank not in RANK_ORDER:
+        return 0, False
+    
+    guessed_idx = RANK_ORDER[guessed_rank]
+    correct_idx = RANK_ORDER[correct_rank]
+    
+    # Check if exact match
+    if guessed_rank == correct_rank:
+        base_points = POINTS_EXACT
+        # Apply streak multiplier: 1.0 + (streak * 0.10)
+        multiplier = 1.0 + (streak * STREAK_MULTIPLIER_BASE)
+        final_points = int(base_points * multiplier)
+        return final_points, True  # Correct guess
+    else:
+        # Calculate rank difference
+        rank_difference = abs(guessed_idx - correct_idx)
+        points = POINTS_EXACT + (rank_difference * POINTS_PER_RANK_OFF)
+        # Minimum 0 points
+        final_points = max(0, points)
+        return final_points, False  # Wrong guess
+
+def load_user_scores() -> dict:
+    """Load user scores from file"""
+    scores_file = 'user_scores.json'
+    if os.path.exists(scores_file):
+        with open(scores_file, 'r') as f:
+            data = json.load(f)
+            # Convert string server IDs back to int
+            server_data = {}
+            for server_id, users in data.items():
+                server_data[int(server_id)] = users
+            return server_data
+    return {}
+
+def save_user_scores(scores_data: dict):
+    """Save user scores to file"""
+    scores_file = 'user_scores.json'
+    # Convert int server IDs to strings for JSON
+    server_data = {}
+    for server_id, users in scores_data.items():
+        server_data[str(server_id)] = users
+    
+    with open(scores_file, 'w') as f:
+        json.dump(server_data, f, indent=2)
+
+def update_user_score(user_id: int, guild_id: int, guessed_rank: str, correct_rank: str, username: str):
+    """Update user's score and streak"""
+    scores_data = load_user_scores()
+    
+    if guild_id not in scores_data:
+        scores_data[guild_id] = {}
+    
+    user_id_str = str(user_id)
+    if user_id_str not in scores_data[guild_id]:
+        scores_data[guild_id][user_id_str] = {
+            'username': username,
+            'total_score': 0,
+            'games_played': 0,
+            'correct_guesses': 0,
+            'current_streak': 0,
+            'best_streak': 0,
+            'history': []
+        }
+    
+    user_data = scores_data[guild_id][user_id_str]
+    current_streak = user_data['current_streak']
+    
+    # Calculate points
+    points, is_correct = calculate_score(guessed_rank, correct_rank, current_streak)
+    
+    # Update streak
+    if is_correct:
+        user_data['current_streak'] += 1
+        user_data['correct_guesses'] += 1
+        if user_data['current_streak'] > user_data['best_streak']:
+            user_data['best_streak'] = user_data['current_streak']
+    else:
+        user_data['current_streak'] = 0
+    
+    # Update stats
+    user_data['username'] = username  # Update username in case it changed
+    user_data['total_score'] += points
+    user_data['games_played'] += 1
+    user_data['history'].append({
+        'guessed': guessed_rank,
+        'correct': correct_rank,
+        'points': points,
+        'streak_at_time': current_streak,
+        'timestamp': datetime.now().isoformat()
+    })
+    
+    # Keep only last 50 games in history
+    if len(user_data['history']) > 50:
+        user_data['history'] = user_data['history'][-50:]
+    
+    save_user_scores(scores_data)
+    print(f"🏆 [SCORE] {username}: {points} points, streak: {user_data['current_streak']}")
+    return points, user_data['current_streak']
+
+def get_user_guess_from_clip(clip_id: str, guild_id: int, user_id: int) -> str:
+    """Get a specific user's guess for a clip"""
+    results_data = load_results_data()
+    
+    if guild_id not in results_data or clip_id not in results_data[guild_id]:
+        return None
+    
+    clip_data = results_data[guild_id][clip_id]
+    user_votes = clip_data.get('user_votes', {})
+    
+    return user_votes.get(str(user_id))
+
+
+async def get_results_embed_with_users(clip_id: str, guild_id: int, bot_instance) -> tuple[discord.Embed, str, str]:
+    """Generate results embed showing individual user votes"""
+    results_data = load_results_data()
+    
+    if guild_id not in results_data or clip_id not in results_data[guild_id]:
+        print(f"📊 [RESULTS] No data found for clip {clip_id} in guild {guild_id}")
+        return None, None, None
+    
+    clip_data = results_data[guild_id][clip_id]
+    correct_rank = clip_data.get('correct_rank', 'Unknown')
+    total_votes = clip_data.get('total_votes', 0)
+    video_url = clip_data.get('video_url', None)
+    submitter_id = clip_data.get('submitter_id', None)
+    user_votes = clip_data.get('user_votes', {})
+    
+    print(f"📊 [RESULTS] Generating detailed results for clip {clip_id}")
+    
+    # Calculate correct guess percentage
+    votes_data = clip_data.get('votes', {})
+    correct_votes = votes_data.get(correct_rank, 0)
+    correct_percentage = (correct_votes / total_votes * 100) if total_votes > 0 else 0
+    
+    # Get submitter username
+    submitter_name = "Unknown User"
+    if submitter_id:
+        try:
+            user = bot_instance.get_user(int(submitter_id))
+            if not user:
+                user = await bot_instance.fetch_user(int(submitter_id))
+            if user:
+                submitter_name = user.display_name
+        except:
+            pass
+    
+    # Create the main message content
+    main_content = f"🎯 **Result**\n"
+    main_content += f"Clip sent by: **{submitter_name}**\n"
+    main_content += f"Correct Rank guess: **{correct_percentage:.1f}%** ({correct_votes}/{total_votes} votes)\n"
+    main_content += f"Details below:"
+    
+    # Create the embed for detailed results
+    embed = discord.Embed(
+        title="📊 Detailed Vote Distribution",
+        description=f"**Correct Rank:** {correct_rank} • **Total Votes:** {total_votes}",
+        color=0x7AB0E7
+    )
+    
+    # Add video if available
+    if video_url:
+        embed.add_field(name="🎬 Original Video", value=f"[Watch Video]({video_url})", inline=False)
+        embed.set_image(url=video_url)
+    
+    # Group users by their votes and show individual guesses
+    rank_users = {}
+    for user_id_str, voted_rank in user_votes.items():
+        if voted_rank not in rank_users:
+            rank_users[voted_rank] = []
+        
+        # Get username
+        try:
+            user = bot_instance.get_user(int(user_id_str))
+            if not user:
+                user = await bot_instance.fetch_user(int(user_id_str))
+            username = user.display_name if user else f"User-{user_id_str[-4:]}"
+        except:
+            username = f"User-{user_id_str[-4:]}"
+        
+        rank_users[voted_rank].append(username)
+    
+    # Create detailed breakdown showing users for each rank
+    results_text = ""
+    for rank in RANKS:
+        rank_name = rank['name']
+        votes_count = votes_data.get(rank_name, 0)
+        percentage = (votes_count / total_votes * 100) if total_votes > 0 else 0
+        emoji = rank['emoji']
+        
+        # Get users who voted for this rank
+        users_for_rank = rank_users.get(rank_name, [])
+        users_text = ", ".join(users_for_rank[:8])  # Limit to 8 names to avoid too long messages
+        if len(users_for_rank) > 8:
+            users_text += f" +{len(users_for_rank) - 8} more"
+        
+        if rank_name == correct_rank:
+            results_text += f"{emoji} **{rank_name}**: {votes_count} votes ({percentage:.1f}%) ✅\n"
+        else:
+            results_text += f"{emoji} {rank_name}: {votes_count} votes ({percentage:.1f}%)\n"
+        
+        if users_for_rank:
+            results_text += f"   └ *{users_text}*\n"
+    
+    embed.add_field(name="🗳️ Votes by Rank", value=results_text, inline=False)
+    
+    print(f"📊 [RESULTS] Detailed results generated with {len(user_votes)} individual votes")
+    return embed, main_content, video_url
+
 
 async def upload_to_catbox(file_path: str) -> str | None:
     """Upload video to catbox.moe and return the URL with progress tracking"""
@@ -1026,10 +1237,9 @@ def save_vote(clip_id: str, guessed_rank: str, user_id: int):
     return True
 
 def get_results_embed(clip_id: str, guild_id: int) -> tuple[discord.Embed, str, str]:
-    """Generate results embed with percentages for a specific server"""
+    """Generate results embed with percentages for a specific server (original function for auto-results)"""
     results_data = load_results_data()
     
-    # Check if server and clip exist
     if guild_id not in results_data or clip_id not in results_data[guild_id]:
         print(f"📊 [RESULTS] No data found for clip {clip_id} in guild {guild_id}")
         return None, None, None
@@ -1040,22 +1250,17 @@ def get_results_embed(clip_id: str, guild_id: int) -> tuple[discord.Embed, str, 
     video_url = clip_data.get('video_url', None)
     submitter_id = clip_data.get('submitter_id', None)
     
-    print(f"📊 [RESULTS] Generating results for clip {clip_id}")
-    print(f"    🏆 Correct rank: {correct_rank}")
-    print(f"    🗳️ Total votes: {total_votes}")
-    print(f"    🎬 Video URL: {video_url}")
-    print(f"    👤 Submitter ID: {submitter_id}")
-    
     # Calculate correct guess percentage
     votes_data = clip_data.get('votes', {})
     correct_votes = votes_data.get(correct_rank, 0)
     correct_percentage = (correct_votes / total_votes * 100) if total_votes > 0 else 0
     
     # Create the main message content
-    main_content = f"🎯 **Result Guess The Rank**\n"
+    main_content = f"🎯 **Result**\n"
     if submitter_id:
         main_content += f"Clip sent by: <@{submitter_id}>\n"
     main_content += f"Correct Rank guess: **{correct_percentage:.1f}%** ({correct_votes}/{total_votes} votes)\n"
+    main_content += f"Details below:"
     
     # Create the embed for detailed results
     embed = discord.Embed(
@@ -1067,7 +1272,6 @@ def get_results_embed(clip_id: str, guild_id: int) -> tuple[discord.Embed, str, 
     # Add video if available
     if video_url:
         embed.add_field(name="🎬 Original Video", value=f"[Watch Video]({video_url})", inline=False)
-        # Set the video as the image in the embed for preview
         embed.set_image(url=video_url)
     
     # Calculate percentages from vote data and create detailed breakdown
@@ -1086,8 +1290,6 @@ def get_results_embed(clip_id: str, guild_id: int) -> tuple[discord.Embed, str, 
     
     embed.add_field(name="🗳️ All Votes", value=results_text, inline=False)
     
-    print(f"📊 [RESULTS] Results embed generated successfully")
-    print(f"    ✅ Correct guess rate: {correct_percentage:.1f}%")
     return embed, main_content, video_url
 
 async def register_persistent_views():
@@ -1135,9 +1337,28 @@ async def check_expired_clips():
                 # Mark as expired
                 clip_data['expired'] = True
                 
+                # Calculate scores for all users who voted
+                correct_rank = clip_data.get('correct_rank', 'Unknown')
+                user_votes = clip_data.get('user_votes', {})
+                
+                guild = bot.get_guild(guild_id)
+                if guild:
+                    for user_id_str, guessed_rank in user_votes.items():
+                        try:
+                            user_id = int(user_id_str)
+                            user = bot.get_user(user_id)
+                            if not user:
+                                user = await bot.fetch_user(user_id)
+                            
+                            if user:
+                                username = user.display_name
+                                points, streak = update_user_score(user_id, guild_id, guessed_rank, correct_rank, username)
+                                print(f"    📊 Updated {username}: {points} points (streak: {streak})")
+                        except Exception as e:
+                            print(f"    ❌ Error updating score for user {user_id_str}: {e}")
+                
                 # Disable the voting view
                 try:
-                    # Create a temporary view instance to disable it
                     temp_view = GuessRankSelector(clip_id, clip_data.get('correct_rank', 'Unknown'))
                     await temp_view.disable_view_in_message(guild_id)
                     print(f"    ✅ Disabled voting view for clip {clip_id}")
@@ -1145,28 +1366,24 @@ async def check_expired_clips():
                     print(f"    ❌ Error disabling view for clip {clip_id}: {e}")
                 
                 # Find the results channel for this specific server
-                guild = bot.get_guild(guild_id)
                 if guild:
                     _, _, results_channel_name = get_channel_names(guild.id)
                     results_channel = discord.utils.get(guild.channels, name=results_channel_name)
                     
                     if results_channel:
-                        # Get results with video and ping
+                        # Get results
                         results_embed, ping_content, video_url = get_results_embed(clip_id, guild_id)
                         
                         if results_embed:
                             try:
-                                # Send the results message with the new format
                                 await results_channel.send(
-                                    content=ping_content,  # This now contains the full formatted message
+                                    content=ping_content,
                                     embed=results_embed
                                 )
                                 print(f"    ✅ Posted results for clip {clip_id} to {results_channel.name}")
                                 
                             except Exception as e:
                                 print(f"    ❌ Error posting results to {guild.name}: {e}")
-                        else:
-                            print(f"    ❌ Failed to generate results embed for clip {clip_id}")
                     else:
                         print(f"    ❌ Results channel '{results_channel_name}' not found in guild {guild.name}")
                 else:
@@ -1204,8 +1421,8 @@ import tempfile
 import asyncio
 import subprocess
 
-async def blur_video(input_path: str, target_size_mb: int = 15) -> str:
-    """Apply adaptive blur and compress video using FFmpeg with memory optimization."""
+async def blur_video(input_path: str, target_size_mb: int = 25) -> str:
+    """Apply adaptive blur and compress video using FFmpeg with optimized quality for Catbox."""
     log_memory_usage("Video processing start")
     
     # Create temporary output file
@@ -1239,24 +1456,43 @@ async def blur_video(input_path: str, target_size_mb: int = 15) -> str:
         height = int(video_stream['height'])
         duration = float(probe_data['format']['duration'])
         
+        # Get original bitrate for reference
+        original_bitrate = int(probe_data['format'].get('bit_rate', 0)) // 1000  # Convert to kbps
+        
         supported_resolutions = [(1920, 1080), (1280, 720)]
         if (width, height) not in supported_resolutions:
             print(f"❌ [RESOLUTION] Unsupported resolution: {width}x{height}")
             print(f"    Supported resolutions: 1920x1080 (1080p), 1280x720 (720p)")
             raise UnsupportedResolutionError(width, height)
+        
         print(f"📐 [VIDEO_INFO] Resolution: {width}x{height}, Duration: {duration:.1f}s")
+        print(f"📊 [VIDEO_INFO] Original bitrate: {original_bitrate}kbps")
 
         # Force garbage collection before heavy processing
         gc.collect()
         log_memory_usage("Before FFmpeg processing")
 
-        # Compute bitrate with lower target for VPS
+        # Compute target bitrate - more generous since we're using Catbox
+        # Base calculation but with higher targets
         target_bitrate_kbps = int((target_size_mb * 8192) / duration)
-        target_bitrate_kbps = max(400, min(target_bitrate_kbps, 4000))  # Reduced max bitrate
         
-        print(f"🎯 [ENCODING] Target bitrate: {target_bitrate_kbps}kbps")
+        # Set better quality ranges based on resolution
+        if width == 1920 and height == 1080:  # 1080p
+            min_bitrate = 1500  # Increased from 400
+            max_bitrate = 8000  # Increased from 4000
+            target_crf = 22     # Better quality (lower CRF)
+        else:  # 720p
+            min_bitrate = 1000  # Increased from 300
+            max_bitrate = 6000  # Increased from 3000
+            target_crf = 23     # Better quality for 720p
+        
+        # Clamp the target bitrate to reasonable bounds
+        target_bitrate_kbps = max(min_bitrate, min(target_bitrate_kbps, max_bitrate))
+        
+        print(f"🎯 [ENCODING] Target bitrate: {target_bitrate_kbps}kbps (range: {min_bitrate}-{max_bitrate})")
+        print(f"🎯 [ENCODING] Target CRF: {target_crf}")
 
-        # Build base FFmpeg command with memory-optimized settings
+        # Build base FFmpeg command with better quality settings
         ffmpeg_cmd = ['ffmpeg', '-y', '-i', input_path]
 
         # Conditional blur based on resolution
@@ -1312,24 +1548,30 @@ async def blur_video(input_path: str, target_size_mb: int = 15) -> str:
             print(f"🎨 [BLUR] No blur applied - unsupported resolution")
             ffmpeg_cmd += ['-map', '0:v']
 
-        # VPS-optimized encoding settings
+        # Better encoding settings for Catbox upload
         ffmpeg_cmd += [
             '-c:v', 'libx264',
-            '-preset', 'fast',  # Changed from 'medium' to 'fast' for VPS
-            '-crf', '24',       # Slightly higher CRF for faster encoding
+            '-preset', 'fast',              # Still fast for VPS but better quality than ultrafast
+            '-crf', str(target_crf),        # Lower CRF = better quality
             '-maxrate', f'{target_bitrate_kbps}k',
-            '-bufsize', f'{target_bitrate_kbps}k',  # Reduced buffer size
+            '-bufsize', f'{target_bitrate_kbps * 2}k',  # Larger buffer for better quality
             '-c:a', 'aac',
-            '-b:a', '96k',      # Reduced audio bitrate
+            '-b:a', '128k',                 # Increased audio bitrate from 96k
+            '-ac', '2',                     # Ensure stereo audio
+            '-ar', '44100',                 # Standard audio sample rate
             '-pix_fmt', 'yuv420p',
             '-movflags', '+faststart',
-            '-threads', '1',    # Limit to 1 thread for 1 vCore
+            '-profile:v', 'high',           # H.264 High Profile for better compression
+            '-level:v', '4.1',              # Compatibility level
+            '-threads', '2',                # Use 2 threads (slightly more than before)
+            '-g', '50',                     # GOP size for better seeking
             output_path
         ]
 
-        print(f"🚀 [FFMPEG] Starting encoding process...")
+        print(f"🚀 [FFMPEG] Starting enhanced encoding process...")
+        print(f"    📐 Settings: CRF={target_crf}, Bitrate={target_bitrate_kbps}k, Audio=128k")
         
-        # Execute FFmpeg
+        # Execute FFmpeg with progress monitoring
         proc = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -1342,7 +1584,20 @@ async def blur_video(input_path: str, target_size_mb: int = 15) -> str:
             raise Exception(f"FFmpeg failed: {stderr.decode()}")
 
         final_size = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"✅ [FFMPEG] Encoding completed. Output size: {final_size:.2f}MB")
+        
+        # Calculate final bitrate
+        final_bitrate = int((final_size * 8192) / duration)
+        
+        print(f"✅ [FFMPEG] Encoding completed successfully!")
+        print(f"    📦 Output size: {final_size:.2f}MB (target: {target_size_mb}MB)")
+        print(f"    📊 Final bitrate: {final_bitrate}kbps (target: {target_bitrate_kbps}kbps)")
+        print(f"    🎵 Audio: 128kbps AAC stereo")
+        
+        # Quality assessment
+        if final_size <= target_size_mb * 1.1:  # Within 10% of target
+            print(f"    ✅ Size target achieved!")
+        else:
+            print(f"    ⚠️ Size slightly over target (acceptable for Catbox)")
         
         # Force garbage collection after processing
         gc.collect()
@@ -1823,6 +2078,65 @@ async def setup_channels(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, view=SetupView(), ephemeral=True)
 
+@tree.command(name="scoreboard", description="Show the server scoreboard")
+async def show_scoreboard(interaction: discord.Interaction, limit: int = 10):
+    """Show scoreboard for this server"""
+    if limit < 1 or limit > 25:
+        await interaction.response.send_message("❌ Limit must be between 1 and 25.", ephemeral=True)
+        return
+    
+    guild_id = interaction.guild.id
+    scores_data = load_user_scores()
+    
+    if guild_id not in scores_data or not scores_data[guild_id]:
+        embed = discord.Embed(
+            title="🏆 Server Scoreboard",
+            description="No scores recorded yet! Play some rounds to see rankings.",
+            color=0x7AB0E7
+        )
+        await interaction.response.send_message(embed=embed)
+        return
+    
+    # Sort users by total score
+    users = list(scores_data[guild_id].values())
+    users.sort(key=lambda x: x['total_score'], reverse=True)
+    users = users[:limit]
+    
+    embed = discord.Embed(
+        title=f"🏆 Server Scoreboard - Top {len(users)}",
+        color=0x7AB0E7
+    )
+    
+    scoreboard_text = ""
+    for i, user_data in enumerate(users, 1):
+        username = user_data['username']
+        score = user_data['total_score']
+        games = user_data['games_played']
+        accuracy = (user_data['correct_guesses'] / games * 100) if games > 0 else 0
+        streak = user_data['current_streak']
+        best_streak = user_data['best_streak']
+        
+        # Medals for top 3
+        if i == 1:
+            medal = "🥇"
+        elif i == 2:
+            medal = "🥈"
+        elif i == 3:
+            medal = "🥉"
+        else:
+            medal = f"{i}."
+        
+        streak_text = f"🔥{streak}" if streak > 0 else ""
+        
+        scoreboard_text += f"{medal} **{username}** - {score} pts\n"
+        scoreboard_text += f"   └ {games} games • {accuracy:.1f}% accuracy • Best Steak: {best_streak} | Current Streak : {streak_text}\n"
+    
+    embed.add_field(name="🎯 Rankings", value=scoreboard_text, inline=False)
+    embed.set_footer(text="Play more clips to climb the leaderboard!")
+    
+    await interaction.response.send_message(embed=embed)
+
+
 @tree.command(name="help", description="Show help for Guess The Rank bot")
 async def help_slash_command(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -1852,7 +2166,8 @@ async def help_slash_command(interaction: discord.Interaction):
         value="`/setup` - Configure channels (Admin)\n"
               "`/help` - Show this help\n"
               "`/results` - Browse results from past clips (last 25)\n"
-              "`/cleanup` - Cleanup expired clips (Admin)",
+              "`/cleanup` - Cleanup expired clips (Admin)\n"
+              "`/scoreboard` - Check Guess The Rank Leaderboard",
         inline=False
     )
     embed.add_field(
