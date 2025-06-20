@@ -17,6 +17,7 @@ pip install -r requirements.txt
 - **/results**
 - **/help**
 - **/cleanup** (Admin only)
+- **/scoreboard**
 
 ## What he can do :
 - Receiving a clip under **150MB**, using either default discord embed files, or catbox website.
@@ -25,16 +26,17 @@ pip install -r requirements.txt
 - The clip can either be accepted or rejected, if rejected, its deleted from the channel, if accepted, its deleted and moved to guess-the-rank channel, where you can see the clip, people have 24h to lock their guesses, after locking 1 guess, the guess is locked forever.
 - 24h Later, a small chart with percent is droped, showing how the rank distribution went who send the clip and the rate of sucesss.
 - Admin can cleanup the oldest clip (only for PC performance, doesnt affect anything for user UI because of 25 dropdown limit)
+- A scoreboard is up, allowing to see the current leaderboard of the server, with points, win streak and accuracy.
 
 ## Known Issues
 - **ALL THE CODE** is in the same file
-- Some Json shenarigans happening when deleting data, not affection the algorithm but still weird to see.
+- Some Json shenarigans happening when deleting data, not affecting the good flow of the app but still weird to see.
 
-## What Im working On soon
-- Break time.
+
 
 ## Authors
 - Vapoor
+*Thanks very much to Shark for allowing me to host on his server for free <3*
 
 
 
