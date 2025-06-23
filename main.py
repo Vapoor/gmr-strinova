@@ -913,44 +913,72 @@ async def get_results_embed_with_users(clip_id: str, guild_id: int, bot_instance
         embed.add_field(name="🎬 Original Video", value=f"[Watch Video]({video_url})", inline=False)
         embed.set_image(url=video_url)
     
-    # Group users by their votes and show individual guesses
+    # Group users by their votes and show individual guesses 
     rank_users = {}
 
-    # Collect all user IDs first
-    user_ids_to_fetch = []
+    # First pass: use cached users
+    cached_users = {}
+    users_to_fetch = []
+
     for user_id_str in user_votes.keys():
         try:
             user_id = int(user_id_str)
-            if not bot_instance.get_user(user_id):  # Only fetch if not in cache
-                user_ids_to_fetch.append(user_id)
+            user = bot_instance.get_user(user_id)
+            if user:
+                cached_users[user_id] = user
+            else:
+                users_to_fetch.append(user_id)
         except ValueError:
             continue
 
-    # Batch fetch users (with timeout protection)
+    # Second pass: fetch missing users in smaller batches with retry logic
     fetched_users = {}
-    if user_ids_to_fetch:
-        print(f"    📥 Fetching {len(user_ids_to_fetch)} users not in cache...")
-        for user_id in user_ids_to_fetch[:10]:  # Limit to 10 fetches to prevent long delays
-            try:
-                user = await asyncio.wait_for(bot_instance.fetch_user(user_id), timeout=1.0)
-                if user:
-                    fetched_users[user_id] = user
-            except (asyncio.TimeoutError, discord.NotFound):
-                continue
-            except Exception as e:
-                print(f"    ⚠️ Error fetching user {user_id}: {e}")
-                continue
+    if users_to_fetch:
+        print(f"    📥 Fetching {len(users_to_fetch)} users not in cache...")
+        
+        # Process in batches of 5 to avoid rate limits
+        batch_size = 5
+        for i in range(0, len(users_to_fetch), batch_size):
+            batch = users_to_fetch[i:i+batch_size]
+            
+            for user_id in batch:
+                for attempt in range(3):  # 3 retry attempts
+                    try:
+                        user = await asyncio.wait_for(
+                            bot_instance.fetch_user(user_id), 
+                            timeout=3.0  # Increased timeout
+                        )
+                        if user:
+                            fetched_users[user_id] = user
+                            break  # Success, no need to retry
+                    except (asyncio.TimeoutError, discord.NotFound):
+                        if attempt == 2:  # Last attempt failed
+                            print(f"    ⚠️ Failed to fetch user {user_id} after 3 attempts")
+                        continue
+                    except Exception as e:
+                        print(f"    ⚠️ Error fetching user {user_id}: {e}")
+                        break
+            
+            # Small delay between batches to be nice to Discord API
+            if i + batch_size < len(users_to_fetch):
+                await asyncio.sleep(0.5)
 
-    # Now process votes with cached + fetched users
+    print(f"    ✅ Successfully fetched {len(fetched_users)}/{len(users_to_fetch)} missing users")
+
+    # Third pass: process all votes with improved user data
     for user_id_str, voted_rank in user_votes.items():
         if voted_rank not in rank_users:
             rank_users[voted_rank] = []
         
-        # Get username efficiently
         try:
             user_id = int(user_id_str)
-            user = bot_instance.get_user(user_id) or fetched_users.get(user_id)
-            username = user.display_name if user else f"User-{user_id_str[-4:]}"
+            user = cached_users.get(user_id) or fetched_users.get(user_id)
+            
+            if user:
+                # Use global_name if available (new Discord feature), fallback to display_name
+                username = getattr(user, 'global_name', None) or user.display_name
+            else:
+                username = f"User-{user_id_str[-4:]}"
         except (ValueError, AttributeError):
             username = f"User-{user_id_str[-4:]}"
         
@@ -2064,6 +2092,9 @@ async def on_message(message):
     # Process other commands
     await bot.process_commands(message)
 
+
+# @tree.command(name="mystery", description="Hopecore command")
+
 @tree.command(name="setup", description="Setup channels used for the game")
 async def setup_channels(interaction: discord.Interaction):
     """Command to configure channel names and create channels if needed"""
@@ -2116,11 +2147,11 @@ async def setup_channels(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, view=SetupView(), ephemeral=True)
 
-@tree.command(name="scoreboard", description="Show the server scoreboard")
-async def show_scoreboard(interaction: discord.Interaction, limit: int = 10):
-    """Show scoreboard for this server"""
-    if limit < 1 or limit > 25:
-        await interaction.response.send_message("❌ Limit must be between 1 and 25.", ephemeral=True)
+@tree.command(name="scoreboard", description="Show the server scoreboard with pagination")
+async def show_scoreboard(interaction: discord.Interaction, page: int = 1):
+    """Show scoreboard for this server with pagination (10 users per page)"""
+    if page < 1:
+        await interaction.response.send_message("❌ Page must be 1 or higher.", ephemeral=True)
         return
     
     guild_id = interaction.guild.id
@@ -2136,17 +2167,36 @@ async def show_scoreboard(interaction: discord.Interaction, limit: int = 10):
         return
     
     # Sort users by total score
-    users = list(scores_data[guild_id].values())
-    users.sort(key=lambda x: x['total_score'], reverse=True)
-    users = users[:limit]
+    all_users = list(scores_data[guild_id].values())
+    all_users.sort(key=lambda x: x['total_score'], reverse=True)
+    
+    # Calculate pagination
+    users_per_page = 10
+    total_users = len(all_users)
+    total_pages = (total_users + users_per_page - 1) // users_per_page  # Ceiling division
+    
+    # Validate page number
+    if page > total_pages:
+        await interaction.response.send_message(
+            f"❌ Page {page} doesn't exist. Maximum page is {total_pages} ({total_users} total users).", 
+            ephemeral=True
+        )
+        return
+    
+    # Get users for this page
+    start_idx = (page - 1) * users_per_page
+    end_idx = min(start_idx + users_per_page, total_users)
+    page_users = all_users[start_idx:end_idx]
     
     embed = discord.Embed(
-        title=f"🏆 Server Scoreboard - Top {len(users)}",
+        title=f"🏆 Server Scoreboard - Page {page}/{total_pages}",
+        description=f"Showing ranks {start_idx + 1}-{end_idx} of {total_users} players",
         color=0x7AB0E7
     )
     
     scoreboard_text = ""
-    for i, user_data in enumerate(users, 1):
+    for i, user_data in enumerate(page_users):
+        global_rank = start_idx + i + 1  # Actual position in full leaderboard
         username = user_data['username']
         score = user_data['total_score']
         games = user_data['games_played']
@@ -2154,25 +2204,153 @@ async def show_scoreboard(interaction: discord.Interaction, limit: int = 10):
         streak = user_data['current_streak']
         best_streak = user_data['best_streak']
         
-        # Medals for top 3
-        if i == 1:
-            medal = "🥇"
-        elif i == 2:
-            medal = "🥈"
-        elif i == 3:
-            medal = "🥉"
+        # Medals for top 3 (only on page 1)
+        if page == 1:
+            if global_rank == 1:
+                medal = "🥇"
+            elif global_rank == 2:
+                medal = "🥈"
+            elif global_rank == 3:
+                medal = "🥉"
+            else:
+                medal = f"{global_rank}."
         else:
-            medal = f"{i}."
+            medal = f"{global_rank}."
         
         streak_text = f"🔥{streak}" if streak > 0 else ""
         
         scoreboard_text += f"{medal} **{username}** - {score} pts\n"
-        scoreboard_text += f"   └ {games} games • {accuracy:.1f}% accuracy • Best Steak: {best_streak} | Current Streak : {streak_text}\n"
+        scoreboard_text += f"   └ {games} games • {accuracy:.1f}% accuracy • Best: {best_streak} | Current: {streak_text}\n"
     
     embed.add_field(name="🎯 Rankings", value=scoreboard_text, inline=False)
-    embed.set_footer(text="Play more clips to climb the leaderboard!")
+    
+    # Add navigation info
+    nav_text = f"📄 Use `/scoreboard page:{page+1}` for next page" if page < total_pages else "📄 This is the last page"
+    if page > 1:
+        nav_text = f"📄 Use `/scoreboard page:{page-1}` for previous page\n" + nav_text
+    
+    embed.set_footer(text=nav_text)
     
     await interaction.response.send_message(embed=embed)
+
+@tree.command(name="profile", description="View your guess the rank profile and stats")
+async def show_profile(interaction: discord.Interaction, user: discord.Member = None):
+    """Show profile for yourself or another user"""
+    target_user = user or interaction.user
+    guild_id = interaction.guild.id
+    scores_data = load_user_scores()
+    
+    if guild_id not in scores_data or str(target_user.id) not in scores_data[guild_id]:
+        if target_user == interaction.user:
+            embed = discord.Embed(
+                title="📊 Your Profile",
+                description="You haven't played any games yet! Submit a clip or vote on clips to start building your profile.",
+                color=0x7AB0E7
+            )
+        else:
+            embed = discord.Embed(
+                title=f"📊 {target_user.display_name}'s Profile",
+                description=f"{target_user.display_name} hasn't played any games yet.",
+                color=0x7AB0E7
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    user_data = scores_data[guild_id][str(target_user.id)]
+    
+    # Calculate leaderboard position using user ID instead of username
+    all_users_with_ids = []
+    for user_id_str, user_stats in scores_data[guild_id].items():
+        all_users_with_ids.append({
+            'user_id': user_id_str,
+            'stats': user_stats
+        })
+    
+    # Sort by total score
+    all_users_with_ids.sort(key=lambda x: x['stats']['total_score'], reverse=True)
+    
+    leaderboard_position = None
+    for i, user_entry in enumerate(all_users_with_ids, 1):
+        if user_entry['user_id'] == str(target_user.id):
+            leaderboard_position = i
+            break
+    
+    # Fallback if somehow still not found
+    if leaderboard_position is None:
+        leaderboard_position = "?"
+        print(f"⚠️ [PROFILE] Could not find leaderboard position for user {target_user.id}")
+    
+    # Get user stats
+    username = user_data['username']
+    total_score = user_data['total_score']
+    games_played = user_data['games_played']
+    correct_guesses = user_data['correct_guesses']
+    current_streak = user_data['current_streak']
+    best_streak = user_data['best_streak']
+    accuracy = (correct_guesses / games_played * 100) if games_played > 0 else 0
+    history = user_data.get('history', [])
+    
+    # Create embed
+    title = f"📊 {username}'s Profile" if target_user != interaction.user else "📊 Your Profile"
+    embed = discord.Embed(title=title, color=0x7AB0E7)
+    
+    # Main stats
+    embed.add_field(
+        name="🏆 Overall Stats",
+        value=f"**Score:** {total_score} points\n"
+              f"**Rank:** #{leaderboard_position}/{len(all_users_with_ids)}\n"
+              f"**Games:** {games_played}\n"
+              f"**Accuracy:** {accuracy:.1f}% ({correct_guesses} correct)",
+        inline=True
+    )
+    
+    # Streak info
+    streak_emoji = "🔥" if current_streak > 0 else "💤"
+    embed.add_field(
+        name="🔥 Streak Info",
+        value=f"**Current:** {streak_emoji}{current_streak}\n"
+              f"**Best:** 🏅{best_streak}\n"
+              f"**Status:** {'On fire!' if current_streak >= 3 else 'Keep going!' if current_streak > 0 else 'Ready to start!'}",
+        inline=True
+    )
+    
+    # Recent game (last entry in history)
+    if history:
+        last_game = history[-1]
+        guessed = last_game['guessed']
+        correct = last_game['correct']
+        points = last_game['points']
+        was_correct = guessed == correct
+        
+        result_emoji = "✅" if was_correct else "❌"
+        
+        embed.add_field(
+            name="🎮 Last Game",
+            value=f"{result_emoji} **{guessed}** (Correct: {correct})\n"
+                  f"**Points:** +{points}\n"
+                  f"**Result:** {'Perfect!' if was_correct else f'Off by {abs(RANK_ORDER[guessed] - RANK_ORDER[correct])} rank(s)'}",
+            inline=True
+        )
+    
+    # Add some spacing
+    embed.add_field(name="\u200b", value="\u200b", inline=False)
+    
+    # Performance breakdown (last 10 games if available)
+    if history:
+        recent_games = history[-10:]
+        correct_recent = sum(1 for game in recent_games if game['guessed'] == game['correct'])
+        recent_accuracy = (correct_recent / len(recent_games) * 100)
+        
+        embed.add_field(
+            name="📈 Recent Performance",
+            value=f"**Last {len(recent_games)} games:** {recent_accuracy:.1f}% accuracy\n"
+                  f"**Trend:** {'🔥 Hot streak!' if recent_accuracy > accuracy else '📉 Need practice' if recent_accuracy < accuracy else '📊 Consistent'}",
+            inline=True
+        )
+    
+    embed.set_footer(text=f"Use /scoreboard to see full leaderboard • Profile for {target_user.display_name}")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=(target_user == interaction.user))
 
 
 @tree.command(name="help", description="Show help for Guess The Rank bot")
