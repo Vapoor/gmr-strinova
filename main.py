@@ -408,9 +408,21 @@ class RankSelector(discord.ui.View):
             return
         
         self.selected_rank = self.rank_select.values[0]
-        await interaction.response.send_message(f"Selected rank: **{self.selected_rank}**",ephemeral=True)
         
-        await self.process_and_send_video(interaction)
+        # Show blur selection view
+        view = BlurSelector(self.user_id, self.video_path, self.guild_id, self.selected_rank)
+        
+        embed = discord.Embed(
+            title="🎨 Blur Processing Options",
+            description=f"**Selected rank:** {self.selected_rank}\n\n"
+                    f"**Choose processing method:**\n"
+                    f"🎨 **Apply Blur** - Automatically blur UI elements (recommended)\n"
+                    f"✅ **Already Blurred** - Skip blur if you've already hidden UI elements\n\n"
+                    f"⚠️ Note: Both options will compress the video for optimal upload",
+            color=0x7AB0E7
+        )
+        
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
     
     async def process_and_send_video(self, interaction: discord.Interaction):
         try:
@@ -576,6 +588,220 @@ class RankSelector(discord.ui.View):
             print(f"Processing Error: {e}")
             traceback.print_exc()
             cleanup_files([self.video_path])
+
+
+class BlurSelector(discord.ui.View):
+    def __init__(self, user_id: int, video_path: str, guild_id: int, selected_rank: str):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.video_path = video_path
+        self.guild_id = guild_id
+        self.selected_rank = selected_rank
+        
+        # Blur option buttons
+        self.blur_button = discord.ui.Button(
+            label="Apply Blur (Recommended)",
+            style=discord.ButtonStyle.primary,
+            emoji="🎨",
+            custom_id="apply_blur"
+        )
+        self.no_blur_button = discord.ui.Button(
+            label="Already Blurred",
+            style=discord.ButtonStyle.secondary,
+            emoji="✅",
+            custom_id="no_blur"
+        )
+        
+        self.blur_button.callback = self.blur_callback
+        self.no_blur_button.callback = self.no_blur_callback
+        
+        self.add_item(self.blur_button)
+        self.add_item(self.no_blur_button)
+    
+    async def blur_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This is not your blur selection!", ephemeral=True)
+            return
+        
+        await interaction.response.send_message("🎨 **Processing with blur applied**", ephemeral=True)
+        await self.process_and_send_video(interaction, apply_blur=True)
+    
+    async def no_blur_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This is not your blur selection!", ephemeral=True)
+            return
+        
+        await interaction.response.send_message("✅ **Processing without additional blur**", ephemeral=True)
+        await self.process_and_send_video(interaction, apply_blur=False)
+    
+    async def process_and_send_video(self, interaction: discord.Interaction, apply_blur: bool = True):
+        try:
+            # Get original file size for logging
+            original_size_mb = os.path.getsize(self.video_path) / (1024 * 1024)
+
+            # Check if we need to queue
+            if processing_semaphore.locked() and len(processing_queue) == 0:
+                queue_position = await add_to_queue(self.user_id, interaction)
+            elif len(processing_queue) > 0:
+                queue_position = await add_to_queue(self.user_id, interaction)
+            
+            # Wait for our turn
+            async with processing_semaphore:
+                # Remove from queue when processing starts
+                await remove_from_queue(self.user_id)
+                
+                blur_status = "with smart blur detection" if apply_blur else "without additional blur"
+                await interaction.followup.send(
+                    content=f"🔄 **Processing your video {blur_status}...**\n"
+                        f"📦 Input: {original_size_mb:.1f}MB\n"
+                        f"🎯 Target: ~{TARGET_VIDEO_SIZE_MB}MB with improved bitrate\n"
+                        f"⏱️ This may take a few minutes for quality processing.",
+                    ephemeral=True
+                )
+
+                # Process the video with or without blur
+                try:
+                    blurred_video_path = await asyncio.wait_for(
+                        blur_video(self.video_path, apply_blur=apply_blur),
+                        timeout=1800  # 30min timeout
+                    )
+                except TimeoutError:
+                    await interaction.followup.send(
+                        content="❌ Video processing took too long and timed out.",
+                        ephemeral=True
+                    )
+                    cleanup_files([self.video_path])
+                    return
+
+                final_size_mb = os.path.getsize(blurred_video_path) / (1024 * 1024)
+
+                # Find the moderation channel
+                check_channel = None
+                if self.guild_id:
+                    guild = bot.get_guild(self.guild_id)
+                    if guild:
+                        check_channel_name,_,_ = get_channel_names(guild.id)
+                        check_channel = discord.utils.get(guild.channels, name=check_channel_name)
+
+                if not check_channel:
+                    await interaction.followup.send(
+                        content=f"❌ Moderation channel not found! Use /setup to configure channels.",
+                        ephemeral=True
+                    )
+                    cleanup_files([self.video_path, blurred_video_path])
+                    return
+
+                # Always use external hosting for reliability and visual display
+                video_url = await upload_to_catbox(blurred_video_path)
+
+                if not video_url:
+                    await interaction.followup.send(
+                        content="❌ Failed to upload video to external hosting. Please try again.",
+                        ephemeral=True
+                    )
+                    cleanup_files([self.video_path, blurred_video_path])
+                    return
+
+                # Create moderation message with visual embed
+                blur_text = "🎨 Blur applied" if apply_blur else "✅ No additional blur"
+                message_content = (
+                    f"🎮 **Clip Submission for Review**\n\n"
+                    f"Submitted by: {interaction.user.mention}\n"
+                    f"Claimed rank: **{self.selected_rank}**\n"
+                    f"Processing: {blur_text}\n"
+                    f"File size: {original_size_mb:.1f}MB → {final_size_mb:.1f}MB\n\n"
+                    f"React with ✅ to approve or ❌ to reject this clip."
+                )
+
+                # Create embed that shows video preview directly in Discord
+                embed = discord.Embed(
+                    title="📹 Video Submission",
+                    description=f"Video preview below - click link for full quality\n{blur_text}",
+                    color=0x7AB0E7
+                )
+                embed.set_image(url=video_url)  # This shows the video preview in Discord
+                embed.add_field(name="🎬 Full Quality", value=f"[Open in browser]({video_url})", inline=False)
+                embed.add_field(name="👤 Submitter", value=interaction.user.mention, inline=True)
+                embed.add_field(name="🏆 Claimed Rank", value=f"**{self.selected_rank}**", inline=True)
+                embed.add_field(name="🎨 Processing", value=blur_text, inline=True)
+
+                moderation_message = await check_channel.send(message_content, embed=embed)
+                await moderation_message.add_reaction("✅")
+                await moderation_message.add_reaction("❌")
+
+                # Store moderation data
+                clip_data = {
+                    'rank': self.selected_rank,
+                    'user_id': interaction.user.id,
+                    'user_mention': interaction.user.mention,
+                    'video_url': video_url,
+                    'file_size_mb': final_size_mb,
+                    'guild_id': self.guild_id,
+                    'blur_applied': apply_blur
+                }
+
+                if not hasattr(bot, 'pending_clips'):
+                    if os.path.exists(CLIP_DATA_FILE):
+                        with open(CLIP_DATA_FILE, 'r') as f:
+                            data = json.load(f)
+                            bot.pending_clips = {}
+                            # Convert string keys to int for guild IDs
+                            for guild_str, clips in data.items():
+                                try:
+                                    guild_id = int(guild_str)
+                                    bot.pending_clips[guild_id] = clips
+                                except ValueError:
+                                    # Handle old format where clips were at root level
+                                    if isinstance(clips, dict) and 'guild_id' in clips:
+                                        # This is a clip data, not a server container
+                                        clip_guild_id = clips.get('guild_id', self.guild_id)
+                                        if clip_guild_id not in bot.pending_clips:
+                                            bot.pending_clips[clip_guild_id] = {}
+                                        bot.pending_clips[clip_guild_id][guild_str] = clips
+                    else:
+                        bot.pending_clips = {}
+
+                # Ensure server structure exists
+                if self.guild_id not in bot.pending_clips:
+                    bot.pending_clips[self.guild_id] = {}
+
+                # Store under the message ID
+                bot.pending_clips[self.guild_id][str(moderation_message.id)] = clip_data
+
+                with open(CLIP_DATA_FILE, 'w') as f:
+                    json.dump(bot.pending_clips, f, indent=2)
+
+                processing_text = "with blur applied" if apply_blur else "without additional blur"
+                await interaction.followup.send(
+                    content=f"✅ Video processed {processing_text} and uploaded successfully!\nFinal size: {final_size_mb:.1f}MB\nPreview will be visible in moderation channel.",
+                    ephemeral=True
+                )
+
+                cleanup_files([self.video_path, blurred_video_path])
+
+        except UnsupportedResolutionError as e:
+            # Handle unsupported resolution error specifically
+            await remove_from_queue(self.user_id)
+            print(f"❌ [RESOLUTION] User {interaction.user.name} submitted unsupported resolution: {e.width}x{e.height}")
+            await interaction.followup.send(
+                content=f"❌ **Video resolution not supported: {e.width}x{e.height}**\n\n"
+                    f"**Supported resolutions only:**\n"
+                    f"• 1920x1080 (1080p)\n"
+                    f"• 1280x720 (720p)\n\n"
+                    f"Please convert your video to one of these resolutions and submit again.",
+                ephemeral=True
+            )
+            cleanup_files([self.video_path])
+        except Exception as e:
+            # Make sure to remove from queue on error
+            await remove_from_queue(self.user_id)
+            await interaction.followup.send(
+                content="❌ Processing error. Please contact vaporr on Discord with a screenshot.",
+                ephemeral=True
+            )
+            print(f"Processing Error: {e}")
+            traceback.print_exc()
+            cleanup_files([self.video_path])          
 
 class GuessRankSelector(discord.ui.View):
     def __init__(self, clip_id: str, correct_rank: str):
@@ -1487,7 +1713,7 @@ import tempfile
 import asyncio
 import subprocess
 
-async def blur_video(input_path: str, target_size_mb: int = 25) -> str:
+async def blur_video(input_path: str, target_size_mb: int = 25, apply_blur: bool = True) -> str:
     """Apply adaptive blur and compress video using FFmpeg with optimized quality for Catbox."""
     log_memory_usage("Video processing start")
     
@@ -1531,15 +1757,16 @@ async def blur_video(input_path: str, target_size_mb: int = 25) -> str:
             print(f"    Supported resolutions: 1920x1080 (1080p), 1280x720 (720p)")
             raise UnsupportedResolutionError(width, height)
         
+        blur_status = "with blur" if apply_blur else "compression only"
         print(f"📐 [VIDEO_INFO] Resolution: {width}x{height}, Duration: {duration:.1f}s")
         print(f"📊 [VIDEO_INFO] Original bitrate: {original_bitrate}kbps")
+        print(f"🎨 [PROCESSING] Mode: {blur_status}")
 
         # Force garbage collection before heavy processing
         gc.collect()
         log_memory_usage("Before FFmpeg processing")
 
         # Compute target bitrate - more generous since we're using Catbox
-        # Base calculation but with higher targets
         target_bitrate_kbps = int((target_size_mb * 8192) / duration)
         
         # Set better quality ranges based on resolution
@@ -1561,8 +1788,8 @@ async def blur_video(input_path: str, target_size_mb: int = 25) -> str:
         # Build base FFmpeg command with better quality settings
         ffmpeg_cmd = ['ffmpeg', '-y', '-i', input_path]
 
-        # Conditional blur based on resolution
-        if (width == 1920 and height == 1080) or (width == 1280 and height == 720):
+        # Conditional blur based on user choice and resolution
+        if apply_blur and ((width == 1920 and height == 1080) or (width == 1280 and height == 720)):
             # Scale factor for 720p (2/3 of 1080p values)
             scale = 2/3 if width == 1280 else 1
             
@@ -1611,7 +1838,10 @@ async def blur_video(input_path: str, target_size_mb: int = 25) -> str:
 
             ffmpeg_cmd += ['-filter_complex', filter_complex, '-map', '[vout]']
         else:
-            print(f"🎨 [BLUR] No blur applied - unsupported resolution")
+            if not apply_blur:
+                print(f"🎨 [BLUR] Skipping blur as requested by user")
+            else:
+                print(f"🎨 [BLUR] No blur applied - unsupported resolution")
             ffmpeg_cmd += ['-map', '0:v']
 
         # Better encoding settings for Catbox upload
@@ -1634,7 +1864,8 @@ async def blur_video(input_path: str, target_size_mb: int = 25) -> str:
             output_path
         ]
 
-        print(f"🚀 [FFMPEG] Starting enhanced encoding process...")
+        processing_mode = "enhanced encoding with blur" if apply_blur else "compression-only encoding"
+        print(f"🚀 [FFMPEG] Starting {processing_mode}...")
         print(f"    📐 Settings: CRF={target_crf}, Bitrate={target_bitrate_kbps}k, Audio=128k")
         
         # Execute FFmpeg with progress monitoring
@@ -1658,6 +1889,7 @@ async def blur_video(input_path: str, target_size_mb: int = 25) -> str:
         print(f"    📦 Output size: {final_size:.2f}MB (target: {target_size_mb}MB)")
         print(f"    📊 Final bitrate: {final_bitrate}kbps (target: {target_bitrate_kbps}kbps)")
         print(f"    🎵 Audio: 128kbps AAC stereo")
+        print(f"    🎨 Blur: {'Applied' if apply_blur else 'Skipped'}")
         
         # Quality assessment
         if final_size <= target_size_mb * 1.1:  # Within 10% of target
