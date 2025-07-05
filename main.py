@@ -29,7 +29,7 @@ CLIP_DATA_FILE = 'pending_clips.json'
 RESULTS_DATA_FILE = 'clip_results.json'
 video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
 MAX_CONCURRENT_PROCESSING = 1 # Max threads to not blow ffmpeg 
-MAX_FILE_SIZE_MB = 150
+MAX_FILE_SIZE_MB = 200
 TARGET_VIDEO_SIZE_MB = 25
 processing_semaphore = Semaphore(MAX_CONCURRENT_PROCESSING)
 processing_queue = [] # Tuple containing user_id / message of position
@@ -1336,7 +1336,7 @@ async def update_queue_position(user_id: int):
         if not user_found:
             break  # User no longer in queue, stop updating
 
-async def download_video_from_url(url: str, max_size_mb: int = 150) -> str | None:
+async def download_video_from_url(url: str, max_size_mb: int = 200) -> str | None:
     try:
         print(f"⬇️ [DOWNLOAD] Starting download from: {url}")
         log_memory_usage("Download start")
