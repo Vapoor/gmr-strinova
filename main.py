@@ -1796,10 +1796,10 @@ async def blur_video(input_path: str, target_size_mb: int = 25, apply_blur: bool
             print(f"🎨 [BLUR] Applying blur with scale factor: {scale}")
             
             # Blur parameters (1080p base values, scaled for 720p)
-            left_blur_x = int(103 * scale)
-            left_blur_y = int(98 * scale)
-            left_blur_width = int(333 * scale)
-            left_blur_height = int(310 * scale)
+            left_blur_x = int(0 * scale)
+            left_blur_y = int(90 * scale)
+            left_blur_width = int(428 * scale)
+            left_blur_height = int(318 * scale)
 
             bottom_blur_width = int(293 * scale)
             bottom_blur_height = int(28 * scale)
